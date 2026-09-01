@@ -167,6 +167,105 @@ def test_model_trains_a_few_steps_with_each_router_scoring(router_scoring):
     assert losses[-1] < losses[0]
 
 
+# -- Multi-Token Prediction (moe-modernization Requirement 6) ---------------
+
+
+def test_mtp_depth_zero_is_a_structural_no_op():
+    """Requirement 6.2: `mtp_depth == 0` (default) -> no MTP heads, nothing
+    in the state dict, and `forward` returns exactly `(logits, {"aux_loss":
+    ...})` even when `targets` is passed."""
+    torch.manual_seed(0)
+    config = _tiny_config()
+    assert config.mtp_depth == 0
+    model = QwenMoEModel(config)
+
+    assert len(model.mtp_heads) == 0
+    assert not any("mtp_heads" in k for k in model.state_dict())
+
+    x = torch.randint(0, config.vocab_size, (2, 8))
+    y = torch.randint(0, config.vocab_size, (2, 8))
+    model.train()
+    logits_no_targets, extras_no_targets = model(x)
+    logits_targets, extras_targets = model(x, targets=y)
+
+    assert set(extras_targets) == {"aux_loss"}
+    assert set(extras_no_targets) == {"aux_loss"}
+    assert torch.equal(logits_no_targets, logits_targets)
+
+
+def test_mtp_depth_one_adds_params_and_exactly_one_loss_term():
+    """Requirement 6.1, 6.3: one head -> one extra CE term; params grow."""
+    torch.manual_seed(0)
+    base = QwenMoEModel(_tiny_config())
+    mtp = QwenMoEModel(_tiny_config(mtp_depth=1))
+
+    n_base = sum(p.numel() for p in base.parameters())
+    n_mtp = sum(p.numel() for p in mtp.parameters())
+    assert n_mtp > n_base
+
+    x = torch.randint(0, mtp.config.vocab_size, (2, 8))
+    y = torch.randint(0, mtp.config.vocab_size, (2, 8))
+    mtp.train()
+    logits, extras = mtp(x, targets=y)
+
+    assert logits.shape == (2, 8, mtp.config.vocab_size)  # primary head unchanged (Req 6.4)
+    assert len(extras["mtp_losses"]) == 1
+    assert torch.isfinite(extras["mtp_loss"]) and extras["mtp_loss"] > 0
+    assert extras["mtp_loss"].requires_grad  # trains the trunk
+
+
+def test_mtp_heads_are_skipped_at_inference_and_without_targets():
+    """Requirement 6.4: eval mode, or no `targets`, -> no MTP loss, plain
+    return signature (so `generate()` is untouched)."""
+    torch.manual_seed(0)
+    model = QwenMoEModel(_tiny_config(mtp_depth=2))
+    x = torch.randint(0, model.config.vocab_size, (2, 8))
+    y = torch.randint(0, model.config.vocab_size, (2, 8))
+
+    model.eval()
+    _, extras_eval = model(x, targets=y)
+    assert set(extras_eval) == {"aux_loss"}
+
+    model.train()
+    _, extras_no_targets = model(x)  # trainer always passes targets; a stray caller may not
+    assert set(extras_no_targets) == {"aux_loss"}
+
+
+def test_mtp_depth_two_is_a_causal_chain_of_two_losses():
+    torch.manual_seed(0)
+    model = QwenMoEModel(_tiny_config(mtp_depth=2, d_model=32))
+    x = torch.randint(0, model.config.vocab_size, (3, 10))
+    y = torch.randint(0, model.config.vocab_size, (3, 10))
+    model.train()
+
+    _, extras = model(x, targets=y)
+
+    assert len(extras["mtp_losses"]) == 2
+    assert all(torch.isfinite(v) for v in extras["mtp_losses"])
+    # head 2 consumes head 1's output -> a grad path from mtp_losses[1] to head 1
+    extras["mtp_losses"][1].backward(retain_graph=True)
+    assert any(p.grad is not None for p in model.mtp_heads[0].parameters())
+
+
+def test_mtp_checkpoint_round_trips():
+    """Requirement 6.5: the MTP modules save and load like any other
+    submodule."""
+    torch.manual_seed(0)
+    model = QwenMoEModel(_tiny_config(mtp_depth=2))
+    restored = QwenMoEModel(_tiny_config(mtp_depth=2))
+    restored.load_state_dict(model.state_dict())
+
+    x = torch.randint(0, model.config.vocab_size, (2, 8))
+    y = torch.randint(0, model.config.vocab_size, (2, 8))
+    model.train()
+    restored.train()
+    torch.manual_seed(1)
+    _, a = model(x, targets=y)
+    torch.manual_seed(1)
+    _, b = restored(x, targets=y)
+    assert torch.allclose(a["mtp_loss"], b["mtp_loss"], atol=1e-6)
+
+
 def test_gradients_flow_through_embedding_and_every_block():
     config = _tiny_config()
     model = QwenMoEModel(config)

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from qwenmoe.config import ModelConfig
 from qwenmoe.model.block import TransformerBlock
+from qwenmoe.model.mtp import MTPHead
 from qwenmoe.model.rmsnorm import RMSNorm
 from qwenmoe.model.trace import LayerTrace, TraceBundle
 
@@ -30,10 +31,20 @@ def _trunc_normal_(tensor: torch.Tensor, std: float) -> None:
 
 
 class QwenMoEModel(nn.Module):
-    """`forward(input_ids) -> (logits, {"aux_loss": ...})`. `aux_loss` is
-    the mean (not sum) of every block's MoE auxiliary loss, so its scale
-    stays comparable across configs with a different `n_layers`; it's
-    `None` only if every block's balancer produced no loss to report.
+    """`forward(input_ids, targets=None) -> (logits, extras)`.
+
+    `extras["aux_loss"]` is the mean (not sum) of every block's MoE
+    auxiliary loss, so its scale stays comparable across configs with a
+    different `n_layers`; it's `None` only if every block's balancer
+    produced no loss to report.
+
+    `extras` additionally carries `"mtp_loss"` (mean cross-entropy across
+    the Multi-Token-Prediction heads) and `"mtp_losses"` (the per-head
+    list) -- but only when `ModelConfig.mtp_depth > 0` **and** the model is
+    in training mode **and** `targets` was passed (the trainer passes it).
+    Inference, eval, or `mtp_depth == 0` all return exactly the pre-spec
+    `(logits, {"aux_loss": ...})`, so `generate()` and every other caller
+    are untouched (Requirement 6.2, 6.4).
     """
 
     def __init__(self, config: ModelConfig):
@@ -45,6 +56,9 @@ class QwenMoEModel(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embedding.weight  # Requirement 1.7
+        # Requirement 6.1/6.2: an empty ModuleList when mtp_depth == 0 --
+        # zero extra parameters, nothing in state_dict, forward unchanged.
+        self.mtp_heads = nn.ModuleList(MTPHead(config) for _ in range(config.mtp_depth))
 
         # Principled init (moe-modernization Requirement 9): truncated
         # normal at `init_std` for every linear + the embedding (replacing
@@ -73,7 +87,9 @@ class QwenMoEModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             _trunc_normal_(module.weight, self.config.init_std)
 
-    def forward(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    def forward(
+        self, input_ids: torch.Tensor, targets: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, dict]:
         seq_len = input_ids.shape[1]
         positions = torch.arange(seq_len, device=input_ids.device)
 
@@ -84,10 +100,61 @@ class QwenMoEModel(nn.Module):
             if aux_loss is not None:
                 aux_losses.append(aux_loss)
 
-        x = self.final_norm(x)
-        logits = self.lm_head(x)
+        trunk_hidden = x  # pre-final-norm residual stream -- MTP depth 1's input
+        normed = self.final_norm(x)
+        logits = self.lm_head(normed)
         combined_aux_loss = torch.stack(aux_losses).mean() if aux_losses else None
-        return logits, {"aux_loss": combined_aux_loss}
+        extras: dict = {"aux_loss": combined_aux_loss}
+
+        if self.mtp_heads and self.training and targets is not None:
+            mtp_losses = self._mtp_losses(trunk_hidden, input_ids, targets, positions)
+            if mtp_losses:
+                extras["mtp_losses"] = mtp_losses
+                extras["mtp_loss"] = torch.stack(mtp_losses).mean()
+
+        return logits, extras
+
+    def _mtp_losses(
+        self,
+        trunk_hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """One cross-entropy term per MTP head (Requirement 6.1). Head `k`
+        (1-indexed) at position `i` fuses depth-`(k-1)`'s hidden state with
+        `embedding(input_ids[i + k])` and predicts `targets[i + k]` (the
+        token at offset `k + 1` from `i`). The heads form a causal chain --
+        head `k + 1` consumes head `k`'s output hidden -- so head `k`
+        genuinely predicts one step further than head `k - 1`.
+
+        `input_ids[:, k:]` and `targets[:, k:]` do the left-shift; positions
+        with no valid `i + k` target are simply not included (the usable
+        length shrinks by one per depth). Losses are averaged, not summed,
+        so `mtp_lambda` means the same thing regardless of `mtp_depth`.
+        """
+        seq_len = input_ids.shape[1]
+        losses: list[torch.Tensor] = []
+        hidden = trunk_hidden
+        for depth, head in enumerate(self.mtp_heads, start=1):
+            usable = seq_len - depth
+            if usable < 1:
+                break  # sequence too short to give this depth an (input, target) pair
+            new_hidden = head(
+                hidden[:, :usable, :],
+                self.embedding(input_ids[:, depth : depth + usable]),
+                positions[:usable],
+            )
+            depth_logits = self.lm_head(new_hidden).float()
+            depth_target = targets[:, depth : depth + usable]
+            losses.append(
+                F.cross_entropy(
+                    depth_logits.reshape(-1, depth_logits.size(-1)),
+                    depth_target.reshape(-1),
+                )
+            )
+            hidden = new_hidden
+        return losses
 
     def forward_with_trace(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, TraceBundle]:
         """Requirement 7.1: the exact same computation as `forward`,

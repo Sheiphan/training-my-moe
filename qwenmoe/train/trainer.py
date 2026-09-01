@@ -175,11 +175,12 @@ def _forward_backward_step(
     device: str = "cpu",
     precision: Literal["fp32", "bf16"] = "fp32",
     z_loss_weight: float = 0.0,
-) -> tuple[float, float | None, float | None, float]:
-    """One optimizer step. Returns `(lm_loss, aux_loss, z_loss, grad_norm)`
-    (moe-modernization Requirement 3); `z_loss` is `None` unless
-    `z_loss_weight > 0`, mirroring how `aux_loss` is `None` when no balancer
-    reported a loss.
+) -> tuple[dict, float]:
+    """One optimizer step. Returns `(metrics, grad_norm)` where `metrics` is
+    a dict of Python floats (or `None` / `list[float]`) with keys
+    `lm_loss`, `aux_loss`, `z_loss`, `mtp_loss`, `mtp_losses` -- each `None`
+    when that term is inactive (no balancer, `z_loss_weight == 0`,
+    `mtp_depth == 0`), mirroring how `aux_loss` was already `None`-able.
 
     Precision (Requirement 3.1, 3.2): with `precision == "bf16"` the forward
     pass runs under `torch.autocast(bfloat16)` -- matmuls drop to bf16 while
@@ -189,6 +190,13 @@ def _forward_backward_step(
     the whole loss subgraph is fp32 regardless of `precision`; in the
     `"fp32"` path `.float()` on an already-fp32 tensor is a no-op, keeping
     that path numerically identical to before this task.
+
+    MTP (moe-modernization Requirement 6): `y` is passed to `model` as
+    `targets` so the Multi-Token-Prediction heads (if any) can compute their
+    own cross-entropy terms; the combined loss gains
+    `model.config.mtp_lambda * mean(mtp_losses)`. With `mtp_depth == 0` the
+    model has no MTP heads and `targets` is ignored -- the forward is
+    byte-identical to before this task.
     """
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -199,7 +207,7 @@ def _forward_backward_step(
         else contextlib.nullcontext()
     )
     with autocast_ctx:
-        logits, extras = model(x)
+        logits, extras = model(x, targets=y)
 
     logits = logits.float()  # loss + z-loss always in fp32 (Requirement 3.1)
     loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
@@ -220,18 +228,28 @@ def _forward_backward_step(
         total_loss = total_loss + z_loss_term
         z_loss = z_loss_term.item()
 
+    mtp_loss: float | None = None
+    mtp_losses: list[float] | None = None
+    mtp_mean = extras.get("mtp_loss")
+    if mtp_mean is not None:
+        total_loss = total_loss + model.config.mtp_lambda * mtp_mean
+        mtp_loss = mtp_mean.item()
+        mtp_losses = [t.item() for t in extras["mtp_losses"]]
+
     total_loss.backward()
     # Returns the *pre-clip* global norm (Requirement 1.3) -- clip_grad_norm_
     # computes it before rescaling, so this doubles as a training-health
     # signal: a rising norm here typically precedes a loss spike.
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
     optimizer.step()
-    return (
-        loss.item(),
-        (aux_loss.item() if aux_loss is not None else None),
-        z_loss,
-        float(grad_norm),
-    )
+    metrics = {
+        "lm_loss": loss.item(),
+        "aux_loss": aux_loss.item() if aux_loss is not None else None,
+        "z_loss": z_loss,
+        "mtp_loss": mtp_loss,
+        "mtp_losses": mtp_losses,
+    }
+    return metrics, float(grad_norm)
 
 
 def _run_step(
@@ -243,17 +261,18 @@ def _run_step(
     step: int,
     total_steps: int,
     config: TrainConfig,
-) -> tuple[float, float | None, float | None, float, float, str, QwenMoEModel]:
+) -> tuple[dict, float, float, str, QwenMoEModel]:
     """Runs one training step, falling back to `cpu` if a real `RuntimeError`
     hits mid-step on `mps` (design.md Error Handling: "MPS unavailable/errors
     during a step -> fall back to cpu with a logged warning, never a hard
     crash", Requirement 3.2 -- this also catches a backend that can't run the
-    bf16 autocast path). Returns the (possibly updated) `device`/`model` so
-    the caller keeps using them for subsequent steps.
+    bf16 autocast path). Returns `(metrics, grad_norm, current_lr, device,
+    model)` -- the (possibly updated) `device`/`model` so the caller keeps
+    using them for subsequent steps.
     """
     current_lr = _set_lr(optimizer, config.lr, step, total_steps, config)
     try:
-        train_loss, aux_loss_value, z_loss_value, grad_norm = _forward_backward_step(
+        metrics, grad_norm = _forward_backward_step(
             model,
             optimizer,
             x.to(device),
@@ -274,7 +293,7 @@ def _run_step(
         model = model.to("cpu")
         _move_optimizer_state_to_device(optimizer, "cpu")
         device = "cpu"
-        train_loss, aux_loss_value, z_loss_value, grad_norm = _forward_backward_step(
+        metrics, grad_norm = _forward_backward_step(
             model,
             optimizer,
             x.to(device),
@@ -284,7 +303,7 @@ def _run_step(
             config.precision,
             config.z_loss_weight,
         )
-    return train_loss, aux_loss_value, z_loss_value, grad_norm, current_lr, device, model
+    return metrics, grad_norm, current_lr, device, model
 
 
 def _evaluate(
@@ -433,15 +452,7 @@ class Trainer:
                 x, y = next(train_iter)
 
                 step_start = time.perf_counter()
-                (
-                    train_loss,
-                    aux_loss_value,
-                    z_loss_value,
-                    grad_norm,
-                    current_lr,
-                    device,
-                    model,
-                ) = _run_step(
+                metrics, grad_norm, current_lr, device, model = _run_step(
                     model,
                     optimizer,
                     x,
@@ -454,17 +465,21 @@ class Trainer:
                 elapsed = time.perf_counter() - step_start
 
                 global_step += 1
+                train_loss = metrics["lm_loss"]
+                aux_loss_value = metrics["aux_loss"]
                 final_train_loss = train_loss
                 is_last_step = global_step == total_steps
 
                 if global_step % config.log_interval_steps == 0 or is_last_step:
                     logger.info(
-                        "step %d/%d | loss %.4f | aux_loss %s | z_loss %s | lr %.2e | elapsed %.3fs",
+                        "step %d/%d | loss %.4f | aux_loss %s | z_loss %s | mtp_loss %s "
+                        "| lr %.2e | elapsed %.3fs",
                         global_step,
                         total_steps,
                         train_loss,
                         "n/a" if aux_loss_value is None else f"{aux_loss_value:.4f}",
-                        "n/a" if z_loss_value is None else f"{z_loss_value:.4f}",
+                        "n/a" if metrics["z_loss"] is None else f"{metrics['z_loss']:.4f}",
+                        "n/a" if metrics["mtp_loss"] is None else f"{metrics['mtp_loss']:.4f}",
                         current_lr,
                         elapsed,
                     )
@@ -475,7 +490,9 @@ class Trainer:
                             "step": global_step,
                             "train_loss": train_loss,
                             "aux_loss": aux_loss_value,
-                            "z_loss": z_loss_value,
+                            "z_loss": metrics["z_loss"],
+                            "mtp_loss": metrics["mtp_loss"],
+                            "mtp_losses": metrics["mtp_losses"],
                             "lr": current_lr,
                             "grad_norm": grad_norm,
                             "elapsed_s": elapsed,

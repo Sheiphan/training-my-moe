@@ -441,13 +441,14 @@ def test_forward_backward_step_z_loss_zero_is_plain_cross_entropy():
             logits.reshape(-1, logits.size(-1)), y.reshape(-1)
         ).item()
 
-    lm_loss, _aux, z_loss, grad_norm = _forward_backward_step(
+    metrics, grad_norm = _forward_backward_step(
         model, optimizer, x, y, grad_clip_norm=1.0, device="cpu",
         precision="fp32", z_loss_weight=0.0,
     )
 
-    assert z_loss is None
-    assert lm_loss == pytest.approx(ref_loss, rel=1e-6)
+    assert metrics["z_loss"] is None
+    assert metrics["mtp_loss"] is None  # no MTP heads on this config
+    assert metrics["lm_loss"] == pytest.approx(ref_loss, rel=1e-6)
     assert math.isfinite(grad_norm) and grad_norm >= 0.0
 
 
@@ -462,13 +463,13 @@ def test_forward_backward_step_z_loss_positive_is_returned_and_nonnegative():
     x = torch.randint(0, config.vocab_size, (2, 8))
     y = torch.randint(0, config.vocab_size, (2, 8))
 
-    _lm, _aux, z_loss, _gn = _forward_backward_step(
+    metrics, _gn = _forward_backward_step(
         model, optimizer, x, y, grad_clip_norm=1.0, device="cpu",
         precision="fp32", z_loss_weight=1e-3,
     )
 
-    assert z_loss is not None
-    assert math.isfinite(z_loss) and z_loss >= 0.0
+    assert metrics["z_loss"] is not None
+    assert math.isfinite(metrics["z_loss"]) and metrics["z_loss"] >= 0.0
 
 
 def test_forward_backward_step_bf16_autocast_stays_finite():
@@ -482,12 +483,12 @@ def test_forward_backward_step_bf16_autocast_stays_finite():
     x = torch.randint(0, config.vocab_size, (2, 8))
     y = torch.randint(0, config.vocab_size, (2, 8))
 
-    lm_loss, _aux, _z, grad_norm = _forward_backward_step(
+    metrics, grad_norm = _forward_backward_step(
         model, optimizer, x, y, grad_clip_norm=1.0, device="cpu",
         precision="bf16", z_loss_weight=0.0,
     )
 
-    assert math.isfinite(lm_loss)
+    assert math.isfinite(metrics["lm_loss"])
     assert math.isfinite(grad_norm) and grad_norm >= 0.0
 
 
@@ -553,6 +554,67 @@ def test_trainer_logs_z_loss_field(tmp_path):
         r["z_loss"] is not None and math.isfinite(r["z_loss"]) and r["z_loss"] >= 0.0
         for r in on_steps
     )
+
+
+def test_trainer_runs_with_mtp_and_logs_per_depth_losses(tmp_path):
+    """Requirement 6.1/6.3: a `mtp_depth=2` run trains (loss decreases) and
+    every step record carries `mtp_loss` (the mean) plus `mtp_losses` (the
+    per-depth list, length 2)."""
+    torch.manual_seed(0)
+    config = _tiny_model_config(mtp_depth=2)
+    model = QwenMoEModel(config)
+    train_ds, val_ds = _repeating_datasets()
+    train_config = TrainConfig(
+        batch_size=8,
+        seq_len=16,
+        total_tokens=40 * 8 * 16,
+        lr=1e-2,
+        warmup_steps=5,
+        checkpoint_interval_steps=40,
+        eval_interval_steps=20,
+        log_interval_steps=1,
+        device="cpu",
+        seed=0,
+    )
+
+    result = Trainer(tmp_path).fit(model, train_ds, val_ds, train_config)
+
+    steps = [r for r in _read_jsonl(result.log_path) if r["type"] == "step"]
+    assert len(steps) == 40
+    for record in steps:
+        assert record["mtp_loss"] is not None and math.isfinite(record["mtp_loss"])
+        assert len(record["mtp_losses"]) == 2
+    early = sum(r["train_loss"] for r in steps[:5]) / 5
+    late = sum(r["train_loss"] for r in steps[-5:]) / 5
+    assert late < early
+
+
+def test_trainer_mtp_checkpoint_round_trips(tmp_path):
+    """Requirement 6.5: a resumed MTP run restores its MTP-head weights and
+    continues from the saved step."""
+    config = _tiny_model_config(mtp_depth=1)
+    torch.manual_seed(0)
+    train_ds, val_ds = _repeating_datasets()
+    trainer = Trainer(tmp_path)
+    common = dict(
+        batch_size=8, seq_len=16, checkpoint_interval_steps=20,
+        eval_interval_steps=20, log_interval_steps=1, device="cpu",
+    )
+
+    a = trainer.fit(
+        QwenMoEModel(config), train_ds, val_ds,
+        TrainConfig(total_tokens=20 * 8 * 16, **common),
+    )
+    ckpt = torch.load(a.checkpoint_path, map_location="cpu", weights_only=False)
+    assert any("mtp_heads" in k for k in ckpt["model_state_dict"])
+
+    b = trainer.fit(
+        QwenMoEModel(config), train_ds, val_ds,
+        TrainConfig(total_tokens=30 * 8 * 16, **common),
+        resume_from=a.checkpoint_path,
+    )
+    assert b.final_step == 30
+    assert len([r for r in _read_jsonl(b.log_path) if r["type"] == "step"]) == 30
 
 
 def test_trainer_startup_logs_effective_precision(tmp_path, caplog):

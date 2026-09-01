@@ -154,7 +154,7 @@
     idea, MegaBlocks/GShard links, a small dispatch worked by hand.
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
 
-- [ ] 12. Multi-Token Prediction head
+- [x] 12. Multi-Token Prediction head
   - `qwenmoe/model/mtp.py::MTPHead`; `QwenMoEModel` wires `mtp_depth` heads,
     training-only, returning `extras["mtp_loss"]`; `Trainer` adds
     `mtp_lambda × mtp_loss`; step-log gains per-depth losses.

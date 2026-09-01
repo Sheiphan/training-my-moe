@@ -236,3 +236,21 @@ def test_generate_default_device_is_cpu():
     model, tokenizer = _tiny_setup()
     out = generate(model, tokenizer, "hello", max_new_tokens=5)
     assert isinstance(out, str)
+
+
+def test_generate_works_unchanged_on_an_mtp_model():
+    """moe-modernization Requirement 6.4: MTP heads are training-only, so
+    `generate()` (which runs `model.eval()` and never passes `targets`)
+    behaves exactly as on a non-MTP model."""
+    torch.manual_seed(0)
+    plain, tokenizer = _tiny_setup()
+    torch.manual_seed(0)
+    mtp, _ = _tiny_setup(mtp_depth=2)
+
+    plain_out = generate(plain, tokenizer, "hello", max_new_tokens=8, temperature=0.0)
+    mtp_out = generate(mtp, tokenizer, "hello", max_new_tokens=8, temperature=0.0)
+
+    assert isinstance(mtp_out, str) and mtp_out.startswith("hello")
+    # different weights (MTP model has extra params consuming the RNG stream),
+    # but the generation path itself is identical and greedy-deterministic
+    assert len(mtp_out) == len(plain_out)
