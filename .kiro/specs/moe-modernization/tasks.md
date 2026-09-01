@@ -168,7 +168,7 @@
     example.
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5_
 
-- [ ] 13. KV cache for inference
+- [x] 13. KV cache for inference
   - `qwenmoe/model/kv_cache.py` (`LayerKVCache`, `LatentKVCache`,
     `build_kv_cache`); `Attention.forward`/`MLAAttention.forward` accept an
     optional cache; `generate()` gains `use_kv_cache=True` with prefill +

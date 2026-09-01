@@ -52,6 +52,11 @@ class RotaryEmbedding(nn.Module):
     def attention_bias(self, seq_len: int) -> torch.Tensor | None:
         return None
 
+    def attention_bias_positions(
+        self, q_positions: torch.Tensor, k_positions: torch.Tensor
+    ) -> torch.Tensor | None:
+        return None
+
     def positional_trace(self, positions: torch.Tensor) -> torch.Tensor:
         """The raw rotation angles `apply_to_qk` derives cos/sin from, for
         the embedding/positional-encoding scene to animate the RoPE
@@ -68,6 +73,11 @@ class NoPositional(nn.Module):
         return q, k
 
     def attention_bias(self, seq_len: int) -> torch.Tensor | None:
+        return None
+
+    def attention_bias_positions(
+        self, q_positions: torch.Tensor, k_positions: torch.Tensor
+    ) -> torch.Tensor | None:
         return None
 
     def positional_trace(self, positions: torch.Tensor) -> torch.Tensor | None:
@@ -91,8 +101,24 @@ class AlibiBias(nn.Module):
     def attention_bias(self, seq_len: int) -> torch.Tensor:
         """(n_heads, seq_len, seq_len) bias to add to attention scores
         before the softmax: more negative the further back a key is."""
-        positions = torch.arange(seq_len, device=self.slopes.device, dtype=torch.float32)
-        distance = positions[None, :] - positions[:, None]  # [i, j] = j - i
+        positions = torch.arange(seq_len, device=self.slopes.device)
+        return self.attention_bias_positions(positions, positions)
+
+    def attention_bias_positions(
+        self, q_positions: torch.Tensor, k_positions: torch.Tensor
+    ) -> torch.Tensor:
+        """`(n_heads, len(q_positions), len(k_positions))` ALiBi bias for
+        queries and keys at *arbitrary* absolute positions -- the KV-cache
+        path (moe-modernization Requirement 8) needs this because an
+        incremental decode step has one query at position `N-1` and `N`
+        cached keys, not a square `seq_len × seq_len` block. Entry
+        `[h, i, j] = (k_positions[j] - q_positions[i]) · slope[h]` (more
+        negative the further a key is *before* the query); with
+        `q_positions == k_positions == arange(seq_len)` this reduces exactly
+        to the old square `[h, i, j] = (j - i) · slope[h]`."""
+        q = q_positions.to(device=self.slopes.device, dtype=torch.float32)
+        k = k_positions.to(device=self.slopes.device, dtype=torch.float32)
+        distance = k[None, :] - q[:, None]  # [i, j] = k_pos_j - q_pos_i
         return distance[None, :, :] * self.slopes[:, None, None]
 
     def positional_trace(self, positions: torch.Tensor) -> torch.Tensor:

@@ -23,6 +23,27 @@ from qwenmoe.model.positional import AlibiBias, NoPositional, RotaryEmbedding
 from qwenmoe.model.rmsnorm import RMSNorm
 
 
+def _causal_position_mask(
+    q_positions: torch.Tensor, kv_len: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """`(1, len(q_positions), kv_len)` additive attention mask: `0` where a
+    key (at absolute position `0 … kv_len-1`) is at or before its query's
+    absolute position, `-inf` otherwise.
+
+    Only built on the paths `F.scaled_dot_product_attention(is_causal=True)`
+    can't serve directly -- an ALiBi bias to fold in, or a KV-cache
+    incremental step whose query positions don't line up `1:1` with the key
+    positions (moe-modernization Requirement 8). For the ordinary
+    `q_positions == arange(seq_len)`, `kv_len == seq_len` case it is exactly
+    `torch.triu(full(-inf), diagonal=1)`.
+    """
+    key_pos = torch.arange(kv_len, device=device)
+    allowed = key_pos[None, :] <= q_positions.to(device)[:, None]  # (q_len, kv_len)
+    mask = torch.zeros(q_positions.shape[0], kv_len, device=device, dtype=dtype)
+    mask.masked_fill_(~allowed, float("-inf"))
+    return mask.unsqueeze(0)
+
+
 def build_positional_scheme(config: ModelConfig, head_dim: int) -> nn.Module:
     """Constructs the positional-encoding strategy named by
     `config.positional_scheme` (Requirement 12.1)."""
@@ -69,7 +90,9 @@ class Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim)
             self.k_norm = RMSNorm(self.head_dim)
 
-    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, positions: torch.Tensor, kv_cache=None
+    ) -> torch.Tensor:
         """moe-modernization Requirement 7.1-7.2: the non-trace path calls
         fused `F.scaled_dot_product_attention` instead of materializing an
         explicit `(seq_len, seq_len)` score matrix -- the same causal-GQA
@@ -78,13 +101,17 @@ class Attention(nn.Module):
         `enable_gqa=True` lets SDPA itself broadcast each of the
         `n_kv_heads` key/value heads across its `n_rep` query heads,
         replacing the explicit `repeat_interleave` this method used to do.
-        ALiBi's additive bias can't be combined with `is_causal=True`
-        (SDPA rejects an explicit `attn_mask` together with `is_causal`),
-        so when a positional scheme supplies one, it's pre-summed with an
-        explicit causal `-inf` mask into a single `attn_mask` instead --
-        addition is commutative, so this is the exact same total added to
-        the scores as the old bias-then-causal-mask sequence, just fused
-        into one SDPA call rather than two `scores +=` steps.
+
+        `kv_cache` (moe-modernization Requirement 8, `None` for every
+        training call): a `LayerKVCache`. The freshly-projected, RoPE'd
+        `k`/`v` for *this* call's tokens are appended to it and the full
+        running `k`/`v` come back, so an incremental decode step attends
+        over the whole prefix without re-encoding it. When the query
+        positions no longer line up `1:1` with the keys (an incremental
+        step: one query, `N` keys) or an ALiBi bias must be folded in, an
+        explicit additive `attn_mask` replaces `is_causal=True`; addition
+        is commutative so the ALiBi-plus-causal total is identical to the
+        old bias-then-mask sequence.
         """
         batch, seq_len, _ = x.shape
 
@@ -98,15 +125,21 @@ class Attention(nn.Module):
 
         q, k = self.positional.apply_to_qk(q, k, positions)
 
-        bias = self.positional.attention_bias(seq_len)
-        if bias is None:
+        if kv_cache is not None:
+            k, v = kv_cache.append(k, v)
+        kv_len = k.shape[-2]
+
+        key_positions = torch.arange(kv_len, device=x.device)
+        bias = self.positional.attention_bias_positions(positions, key_positions)
+        if bias is None and kv_len == seq_len:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         else:
-            causal_mask = torch.triu(
-                torch.full((seq_len, seq_len), float("-inf"), device=x.device), diagonal=1
+            attn_mask = _causal_position_mask(positions, kv_len, x.device, q.dtype)
+            if bias is not None:
+                attn_mask = attn_mask + bias.to(q.dtype).unsqueeze(0)
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, enable_gqa=True
             )
-            attn_mask = (bias.to(q.dtype) + causal_mask).unsqueeze(0)  # broadcasts over batch/heads
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=True)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.n_heads * self.head_dim)
         return self.w_o(out)
@@ -235,32 +268,46 @@ class MLAAttention(nn.Module):
         (Requirement 12.4's KV-cache-reduction claim)."""
         return self.latent_dim + self.rope_head_dim
 
-    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, positions: torch.Tensor, kv_cache=None
+    ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
 
-        c_kv = self.w_dkv(x)  # (batch, seq_len, latent_dim) -- this is what generation caches
-        k_content = (
-            self.w_uk(c_kv).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        )
-        v = self.w_uv(c_kv).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        c_kv_new = self.w_dkv(x)  # (batch, seq_len, latent_dim) -- the compressed cache entry
 
         q_content = self.w_q(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-
         q_rope = self.w_qr(x).view(batch, seq_len, self.n_heads, self.rope_head_dim).transpose(1, 2)
-        k_rope = self.w_kr(x).view(batch, seq_len, 1, self.rope_head_dim).transpose(1, 2)
-        q_rope, k_rope = self.rope.apply_to_qk(q_rope, k_rope, positions)
+        k_rope_new = self.w_kr(x).view(batch, seq_len, 1, self.rope_head_dim).transpose(1, 2)
+        q_rope, k_rope_new = self.rope.apply_to_qk(q_rope, k_rope_new, positions)
+
+        # moe-modernization Requirement 8: MLA caches only the shared latent
+        # `c_kv` and the *one* shared decoupled-RoPE key per token -- never
+        # the n_heads-wide decompressed K/V (those are re-derived each step
+        # from the cached latent). `LatentKVCache.append` grows both and
+        # returns the running tensors.
+        if kv_cache is not None:
+            c_kv, k_rope = kv_cache.append(c_kv_new, k_rope_new)
+        else:
+            c_kv, k_rope = c_kv_new, k_rope_new
+        kv_len = c_kv.shape[1]
+
+        k_content = self.w_uk(c_kv).view(batch, kv_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.w_uv(c_kv).view(batch, kv_len, self.n_heads, self.head_dim).transpose(1, 2)
         k_rope = k_rope.expand(-1, self.n_heads, -1, -1)  # one shared key, broadcast to all heads
 
         q = torch.cat([q_content, q_rope], dim=-1)
         k = torch.cat([k_content, k_rope], dim=-1)
 
-        # moe-modernization Requirement 7.1: fused SDPA replaces the explicit
-        # matmul/mask/softmax/matmul below. No ALiBi branch here -- MLA
-        # always uses its own decoupled RoPE (see the class docstring), so
-        # there's never a bias to fold into an explicit attn_mask; SDPA's
-        # default scale (1/sqrt(q's last dim)) already equals
-        # 1/sqrt(head_dim + rope_head_dim) since q is exactly that wide.
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # Fused SDPA (Requirement 7.1). No ALiBi branch -- MLA always uses
+        # its own decoupled RoPE. SDPA's default scale (1/sqrt(q's last dim))
+        # already equals 1/sqrt(head_dim + rope_head_dim) since q is exactly
+        # that wide. An incremental cache step (query positions not lined up
+        # 1:1 with the keys) needs an explicit mask instead of `is_causal`.
+        if kv_len == seq_len:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            attn_mask = _causal_position_mask(positions, kv_len, x.device, q.dtype)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.n_heads * self.head_dim)
         return self.w_o(out)

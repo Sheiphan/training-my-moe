@@ -88,15 +88,27 @@ class QwenMoEModel(nn.Module):
             _trunc_normal_(module.weight, self.config.init_std)
 
     def forward(
-        self, input_ids: torch.Tensor, targets: torch.Tensor | None = None
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        kv_caches: list | None = None,
+        position_offset: int = 0,
     ) -> tuple[torch.Tensor, dict]:
+        """`kv_caches` / `position_offset` (moe-modernization Requirement 8,
+        both inert defaults): `generate(use_kv_cache=True)` passes one cache
+        per block plus the absolute position of `input_ids[:, 0]`, so an
+        incremental decode step feeds a single token and its true position.
+        With the defaults this is exactly the pre-spec forward.
+        """
         seq_len = input_ids.shape[1]
-        positions = torch.arange(seq_len, device=input_ids.device)
+        positions = torch.arange(
+            position_offset, position_offset + seq_len, device=input_ids.device
+        )
 
         x = self.embedding(input_ids)
         aux_losses = []
-        for block in self.blocks:
-            x, aux_loss = block(x, positions)
+        for i, block in enumerate(self.blocks):
+            x, aux_loss = block(x, positions, kv_cache=kv_caches[i] if kv_caches else None)
             if aux_loss is not None:
                 aux_losses.append(aux_loss)
 

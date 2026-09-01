@@ -238,6 +238,19 @@ def test_generate_default_device_is_cpu():
     assert isinstance(out, str)
 
 
+def test_generate_use_kv_cache_composes_with_sampling_filters():
+    """moe-modernization Requirement 8: the `use_kv_cache` flag is
+    orthogonal to `temperature`/`top_k`/`top_p` -- it changes *how* the
+    forward passes are computed, not the sampling."""
+    model, tokenizer = _tiny_setup(max_seq_len=40)
+    out = generate(
+        model, tokenizer, "hello", max_new_tokens=15,
+        temperature=0.8, top_k=5, top_p=0.9, use_kv_cache=True,
+    )
+    assert isinstance(out, str) and out.startswith("hello")
+    assert len(out) == len("hello") + 15
+
+
 def test_generate_works_unchanged_on_an_mtp_model():
     """moe-modernization Requirement 6.4: MTP heads are training-only, so
     `generate()` (which runs `model.eval()` and never passes `targets`)

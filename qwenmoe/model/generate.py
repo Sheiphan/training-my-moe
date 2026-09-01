@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from qwenmoe.model.kv_cache import build_kv_cache
 from qwenmoe.model.transformer import QwenMoEModel
 from qwenmoe.tokenizer.base import Tokenizer
 
@@ -49,6 +50,27 @@ def filter_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
     return filtered
 
 
+def _sample_next(
+    next_logits: torch.Tensor,
+    temperature: float,
+    top_k: int | None,
+    top_p: float | None,
+) -> torch.Tensor:
+    """`(batch, vocab)` last-position logits -> `(batch, 1)` next token id.
+    `temperature <= 0` is deterministic greedy (argmax); otherwise scale,
+    optionally `top_k`/`top_p` filter, softmax, multinomial-sample. Shared
+    verbatim by the cached and uncached decode loops so they can't drift."""
+    if temperature <= 0:
+        return torch.argmax(next_logits, dim=-1, keepdim=True)
+    scaled_logits = next_logits / temperature
+    if top_k is not None:
+        scaled_logits = filter_top_k(scaled_logits, top_k)
+    if top_p is not None:
+        scaled_logits = filter_top_p(scaled_logits, top_p)
+    probs = F.softmax(scaled_logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+
+
 @torch.no_grad()
 def generate(
     model: QwenMoEModel,
@@ -59,6 +81,7 @@ def generate(
     top_k: int | None = None,
     top_p: float | None = None,
     device: str = "cpu",
+    use_kv_cache: bool = False,
 ) -> str:
     """Encodes `prompt`, autoregressively samples up to `max_new_tokens`
     more tokens, and decodes the full resulting sequence back to text
@@ -68,6 +91,15 @@ def generate(
     sampling -- an explicit mode this project adds on top of Requirement
     6.2's "configurable temperature" so there's a decoding path with zero
     randomness to test determinism against.
+
+    `use_kv_cache` (moe-modernization Requirement 8): with the cache on,
+    the prompt is encoded once (a "prefill") and every subsequent step
+    feeds *only* the newest token, attending against each layer's stored
+    keys/values -- `O(n)` total attention work to emit `n` tokens instead
+    of `O(n^2)`. The cached and uncached paths compute the same attention
+    (each token still attends over the identical prefix at its true
+    positions), so greedy decoding produces an identical token sequence
+    (Requirement 8.2).
     """
     if max_new_tokens < 0:
         raise ValueError(f"max_new_tokens must be >= 0, got {max_new_tokens}")
@@ -87,25 +119,22 @@ def generate(
 
     sequence = torch.tensor([token_ids], dtype=torch.long, device=device)
     max_seq_len = model.config.max_seq_len
+    caches = build_kv_cache(model) if use_kv_cache else None
 
     for _ in range(max_new_tokens):
         if sequence.size(1) >= max_seq_len:
-            break  # Requirement 6.3: stop at the model's max context length
+            break  # Requirement 6.3 / 8.4: stop at the model's max context length
 
-        logits, _ = model(sequence)
-        next_logits = logits[:, -1, :]
-
-        if temperature <= 0:
-            next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
+        if caches is None:
+            logits, _ = model(sequence)
+        elif caches[0].length == 0:
+            logits, _ = model(sequence, kv_caches=caches)  # prefill: encode the whole prompt once
         else:
-            scaled_logits = next_logits / temperature
-            if top_k is not None:
-                scaled_logits = filter_top_k(scaled_logits, top_k)
-            if top_p is not None:
-                scaled_logits = filter_top_p(scaled_logits, top_p)
-            probs = F.softmax(scaled_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            logits, _ = model(
+                sequence[:, -1:], kv_caches=caches, position_offset=sequence.size(1) - 1
+            )
 
+        next_token = _sample_next(logits[:, -1, :], temperature, top_k, top_p)
         sequence = torch.cat([sequence, next_token], dim=1)
 
     return tokenizer.decode(sequence[0].tolist())
