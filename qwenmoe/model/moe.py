@@ -257,7 +257,14 @@ class MoELayer(nn.Module):
             if token_idx.numel() == 0:
                 continue  # Requirement 2.5: zero tokens this batch, no error, no gradient
             gate = topk_weights[token_idx, slot_idx].unsqueeze(-1)
-            routed_output.index_add_(0, token_idx, gate * expert(x_flat[token_idx]))
+            # `.to(routed_output.dtype)`: under `torch.autocast(bf16)` the
+            # expert's Linear layers emit bf16, but `routed_output` is the
+            # fp32 residual stream and `index_add_` is dtype-strict. Upcasting
+            # the contribution keeps the scatter-accumulate in fp32 (a plain
+            # no-op in the default fp32 path -- byte-identical to before
+            # moe-modernization task 8).
+            contribution = (gate * expert(x_flat[token_idx])).to(routed_output.dtype)
+            routed_output.index_add_(0, token_idx, contribution)
 
         shared_output = torch.zeros_like(x_flat)
         for expert in self.shared_experts:

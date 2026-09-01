@@ -3,12 +3,20 @@ import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from qwenmoe.config import ModelConfig, TrainConfig
 from qwenmoe.data.dataset import TokenDataset, train_val_split
 from qwenmoe.model.transformer import QwenMoEModel
 from qwenmoe.train.optim import build_optimizer
-from qwenmoe.train.trainer import Trainer, _evaluate, _set_lr, lr_multiplier, select_device
+from qwenmoe.train.trainer import (
+    Trainer,
+    _evaluate,
+    _forward_backward_step,
+    _set_lr,
+    lr_multiplier,
+    select_device,
+)
 
 
 def _tiny_model_config(**overrides):
@@ -404,6 +412,170 @@ def test_trainer_checkpoint_round_trips_for_muon_optimizer(tmp_path):
     assert result_b.final_step == 30
     steps = [r for r in _read_jsonl(result_b.log_path) if r["type"] == "step"]
     assert len(steps) == 30  # not 20 + 30 -- resume picked up from step 20, not step 0
+
+
+# -- Mixed precision + output z-loss (moe-modernization Requirement 3) ------
+
+
+def _step_config(**overrides):
+    defaults = dict(batch_size=2, seq_len=8, total_tokens=100, device="cpu")
+    defaults.update(overrides)
+    return TrainConfig(**defaults)
+
+
+def test_forward_backward_step_z_loss_zero_is_plain_cross_entropy():
+    """Requirement 3.3 invariant: with `z_loss_weight == 0` (and fp32) the
+    reported lm-loss is exactly `F.cross_entropy` on the same logits -- no
+    z-loss term is folded in, and `z_loss` comes back `None`."""
+    torch.manual_seed(0)
+    config = _tiny_model_config()
+    model = QwenMoEModel(config)
+    optimizer = build_optimizer(model, _step_config())
+    x = torch.randint(0, config.vocab_size, (2, 8))
+    y = torch.randint(0, config.vocab_size, (2, 8))
+
+    model.train()
+    with torch.no_grad():
+        logits, _ = model(x)
+        ref_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), y.reshape(-1)
+        ).item()
+
+    lm_loss, _aux, z_loss, grad_norm = _forward_backward_step(
+        model, optimizer, x, y, grad_clip_norm=1.0, device="cpu",
+        precision="fp32", z_loss_weight=0.0,
+    )
+
+    assert z_loss is None
+    assert lm_loss == pytest.approx(ref_loss, rel=1e-6)
+    assert math.isfinite(grad_norm) and grad_norm >= 0.0
+
+
+def test_forward_backward_step_z_loss_positive_is_returned_and_nonnegative():
+    """Requirement 3.3: with a positive weight the z-loss term is a finite,
+    non-negative number (it is `weight * mean(logsumexp(logits)^2)`, a mean
+    of squares scaled by a positive weight)."""
+    torch.manual_seed(0)
+    config = _tiny_model_config()
+    model = QwenMoEModel(config)
+    optimizer = build_optimizer(model, _step_config())
+    x = torch.randint(0, config.vocab_size, (2, 8))
+    y = torch.randint(0, config.vocab_size, (2, 8))
+
+    _lm, _aux, z_loss, _gn = _forward_backward_step(
+        model, optimizer, x, y, grad_clip_norm=1.0, device="cpu",
+        precision="fp32", z_loss_weight=1e-3,
+    )
+
+    assert z_loss is not None
+    assert math.isfinite(z_loss) and z_loss >= 0.0
+
+
+def test_forward_backward_step_bf16_autocast_stays_finite():
+    """Requirement 3.1/3.4: the bf16-autocast forward still produces a
+    finite loss and gradient norm on cpu (bf16 CPU autocast is always
+    available in torch; no gradient scaler is used)."""
+    torch.manual_seed(0)
+    config = _tiny_model_config()
+    model = QwenMoEModel(config)
+    optimizer = build_optimizer(model, _step_config())
+    x = torch.randint(0, config.vocab_size, (2, 8))
+    y = torch.randint(0, config.vocab_size, (2, 8))
+
+    lm_loss, _aux, _z, grad_norm = _forward_backward_step(
+        model, optimizer, x, y, grad_clip_norm=1.0, device="cpu",
+        precision="bf16", z_loss_weight=0.0,
+    )
+
+    assert math.isfinite(lm_loss)
+    assert math.isfinite(grad_norm) and grad_norm >= 0.0
+
+
+def test_trainer_bf16_precision_runs_and_loss_decreases(tmp_path):
+    """Requirement 3.4: a full `precision="bf16"` run over ~50 steps stays
+    finite and its loss is lower at the end than at the start."""
+    torch.manual_seed(0)
+    config = _tiny_model_config()
+    model = QwenMoEModel(config)
+    train_ds, val_ds = _repeating_datasets()
+    train_config = TrainConfig(
+        batch_size=8,
+        seq_len=16,
+        total_tokens=50 * 8 * 16,
+        precision="bf16",
+        lr=1e-2,
+        warmup_steps=5,
+        checkpoint_interval_steps=50,
+        eval_interval_steps=25,
+        log_interval_steps=1,
+        device="cpu",
+        seed=0,
+    )
+
+    result = Trainer(tmp_path).fit(model, train_ds, val_ds, train_config)
+
+    assert result.final_step == 50
+    assert math.isfinite(result.final_train_loss)
+
+    steps = [r for r in _read_jsonl(result.log_path) if r["type"] == "step"]
+    early_mean = sum(r["train_loss"] for r in steps[:5]) / 5
+    late_mean = sum(r["train_loss"] for r in steps[-5:]) / 5
+    assert math.isfinite(early_mean) and math.isfinite(late_mean)
+    assert late_mean < early_mean
+
+
+def test_trainer_logs_z_loss_field(tmp_path):
+    """Requirement 3.3: the z-loss appears as its own step-log field. It is
+    `None` when off and a finite non-negative number when on."""
+    config = _tiny_model_config()
+    train_ds, val_ds = _repeating_datasets()
+    common = dict(
+        batch_size=8,
+        seq_len=16,
+        total_tokens=4 * 8 * 16,
+        checkpoint_interval_steps=4,
+        eval_interval_steps=4,
+        log_interval_steps=1,
+        device="cpu",
+    )
+
+    off = Trainer(tmp_path / "off").fit(
+        QwenMoEModel(config), train_ds, val_ds, TrainConfig(**common)
+    )
+    for record in (r for r in _read_jsonl(off.log_path) if r["type"] == "step"):
+        assert "z_loss" in record and record["z_loss"] is None
+
+    on = Trainer(tmp_path / "on").fit(
+        QwenMoEModel(config), train_ds, val_ds, TrainConfig(z_loss_weight=1e-3, **common)
+    )
+    on_steps = [r for r in _read_jsonl(on.log_path) if r["type"] == "step"]
+    assert on_steps and all(
+        r["z_loss"] is not None and math.isfinite(r["z_loss"]) and r["z_loss"] >= 0.0
+        for r in on_steps
+    )
+
+
+def test_trainer_startup_logs_effective_precision(tmp_path, caplog):
+    """Requirement 3.2 / design.md Error Handling: a startup log line states
+    the effective precision."""
+    config = _tiny_model_config()
+    train_ds, val_ds = _repeating_datasets()
+    train_config = TrainConfig(
+        batch_size=8,
+        seq_len=16,
+        total_tokens=2 * 8 * 16,
+        precision="bf16",
+        checkpoint_interval_steps=2,
+        eval_interval_steps=2,
+        log_interval_steps=1,
+        device="cpu",
+    )
+
+    with caplog.at_level("INFO", logger="qwenmoe.train.trainer"):
+        Trainer(tmp_path).fit(QwenMoEModel(config), train_ds, val_ds, train_config)
+
+    assert "precision" in caplog.text.lower()
+    assert "bf16" in caplog.text.lower()
 
 
 def test_trainer_resume_continues_from_saved_step(tmp_path):

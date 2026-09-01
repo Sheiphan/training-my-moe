@@ -97,7 +97,7 @@
     derivation, a worked 2-layer example, GPT-2 link.
   - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5_
 
-- [ ] 8. Mixed precision + output z-loss
+- [x] 8. Mixed precision + output z-loss
   - `_forward_backward_step`: optional `torch.autocast(bfloat16)`; loss and
     z-loss in `float32`; add `z_loss_weight × mean(logsumexp(logits)²)`;
     step-log gains `z_loss`.

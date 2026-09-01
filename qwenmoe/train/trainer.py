@@ -1,14 +1,15 @@
 """Training loop (Requirement 5): AdamW or Muon (`TrainConfig.optimizer`,
 moe-modernization Requirement 1) with a warmup + cosine-or-WSD
-learning-rate schedule, gradient clipping, device auto-selection (`mps`
-else `cpu`), periodic console +
-JSON-lines logging of per-step metrics (now including gradient norm) and
-per-expert token counts (consumed later by the training-observability
-scenes, task 14), periodic validation loss/perplexity, and checkpoint
-save/resume.
+learning-rate schedule, gradient clipping, optional bf16 autocast +
+output z-loss (moe-modernization Requirement 3), device auto-selection
+(`mps` else `cpu`), periodic console + JSON-lines logging of per-step
+metrics (now including gradient norm and z-loss) and per-expert token
+counts (consumed later by the training-observability scenes, task 14),
+periodic validation loss/perplexity, and checkpoint save/resume.
 """
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import logging
@@ -171,20 +172,66 @@ def _forward_backward_step(
     x: torch.Tensor,
     y: torch.Tensor,
     grad_clip_norm: float,
-) -> tuple[float, float | None, float]:
+    device: str = "cpu",
+    precision: Literal["fp32", "bf16"] = "fp32",
+    z_loss_weight: float = 0.0,
+) -> tuple[float, float | None, float | None, float]:
+    """One optimizer step. Returns `(lm_loss, aux_loss, z_loss, grad_norm)`
+    (moe-modernization Requirement 3); `z_loss` is `None` unless
+    `z_loss_weight > 0`, mirroring how `aux_loss` is `None` when no balancer
+    reported a loss.
+
+    Precision (Requirement 3.1, 3.2): with `precision == "bf16"` the forward
+    pass runs under `torch.autocast(bfloat16)` -- matmuls drop to bf16 while
+    autocast's own op policy keeps softmax / normalization / cross-entropy in
+    fp32, so no gradient scaler is needed (bf16 shares fp32's exponent
+    range). The logits are then cast up to fp32 before the loss and z-loss so
+    the whole loss subgraph is fp32 regardless of `precision`; in the
+    `"fp32"` path `.float()` on an already-fp32 tensor is a no-op, keeping
+    that path numerically identical to before this task.
+    """
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    logits, extras = model(x)
+
+    autocast_ctx: contextlib.AbstractContextManager = (
+        torch.autocast(device_type=device, dtype=torch.bfloat16)
+        if precision == "bf16"
+        else contextlib.nullcontext()
+    )
+    with autocast_ctx:
+        logits, extras = model(x)
+
+    logits = logits.float()  # loss + z-loss always in fp32 (Requirement 3.1)
     loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
     aux_loss = extras.get("aux_loss")
     total_loss = loss if aux_loss is None else loss + aux_loss
+
+    z_loss: float | None = None
+    if z_loss_weight > 0:
+        # `logsumexp(logits)` is `log(sum_v exp(logit_v))` -- the log of the
+        # softmax normalizer Z. Cross-entropy is invariant to adding a
+        # constant to every logit, so nothing else constrains the logits'
+        # absolute scale; left free it drifts up and bf16 then rounds the
+        # large `exp` sum badly. Penalizing `(log Z)^2` pulls Z back toward
+        # 1 without touching the logit *differences* that set the
+        # probabilities (PaLM Sec. 5 / ST-MoE, typical weight ~1e-4).
+        log_z = torch.logsumexp(logits.reshape(-1, logits.size(-1)), dim=-1)
+        z_loss_term = z_loss_weight * log_z.pow(2).mean()
+        total_loss = total_loss + z_loss_term
+        z_loss = z_loss_term.item()
+
     total_loss.backward()
     # Returns the *pre-clip* global norm (Requirement 1.3) -- clip_grad_norm_
     # computes it before rescaling, so this doubles as a training-health
     # signal: a rising norm here typically precedes a loss spike.
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
     optimizer.step()
-    return loss.item(), (aux_loss.item() if aux_loss is not None else None), float(grad_norm)
+    return (
+        loss.item(),
+        (aux_loss.item() if aux_loss is not None else None),
+        z_loss,
+        float(grad_norm),
+    )
 
 
 def _run_step(
@@ -196,17 +243,25 @@ def _run_step(
     step: int,
     total_steps: int,
     config: TrainConfig,
-) -> tuple[float, float | None, float, float, str, QwenMoEModel]:
+) -> tuple[float, float | None, float | None, float, float, str, QwenMoEModel]:
     """Runs one training step, falling back to `cpu` if a real `RuntimeError`
     hits mid-step on `mps` (design.md Error Handling: "MPS unavailable/errors
     during a step -> fall back to cpu with a logged warning, never a hard
-    crash", Requirement 3.2). Returns the (possibly updated) `device`/`model`
-    so the caller keeps using them for subsequent steps.
+    crash", Requirement 3.2 -- this also catches a backend that can't run the
+    bf16 autocast path). Returns the (possibly updated) `device`/`model` so
+    the caller keeps using them for subsequent steps.
     """
     current_lr = _set_lr(optimizer, config.lr, step, total_steps, config)
     try:
-        train_loss, aux_loss_value, grad_norm = _forward_backward_step(
-            model, optimizer, x.to(device), y.to(device), config.grad_clip_norm
+        train_loss, aux_loss_value, z_loss_value, grad_norm = _forward_backward_step(
+            model,
+            optimizer,
+            x.to(device),
+            y.to(device),
+            config.grad_clip_norm,
+            device,
+            config.precision,
+            config.z_loss_weight,
         )
     except RuntimeError as exc:
         if device != "mps":
@@ -219,10 +274,17 @@ def _run_step(
         model = model.to("cpu")
         _move_optimizer_state_to_device(optimizer, "cpu")
         device = "cpu"
-        train_loss, aux_loss_value, grad_norm = _forward_backward_step(
-            model, optimizer, x.to(device), y.to(device), config.grad_clip_norm
+        train_loss, aux_loss_value, z_loss_value, grad_norm = _forward_backward_step(
+            model,
+            optimizer,
+            x.to(device),
+            y.to(device),
+            config.grad_clip_norm,
+            device,
+            config.precision,
+            config.z_loss_weight,
         )
-    return train_loss, aux_loss_value, grad_norm, current_lr, device, model
+    return train_loss, aux_loss_value, z_loss_value, grad_norm, current_lr, device, model
 
 
 def _evaluate(
@@ -323,6 +385,20 @@ class Trainer:
         device = select_device(config.device)
         torch.manual_seed(config.seed)
 
+        # Requirement 3.2 / design.md Error Handling: state the effective
+        # precision up front. bf16 means the forward pass runs under
+        # `torch.autocast`; if the backend can't, `_run_step` catches the
+        # RuntimeError and drops to cpu for the rest of the run.
+        effective_precision = (
+            "bf16 (torch.autocast)" if config.precision == "bf16" else "fp32"
+        )
+        logger.info(
+            "effective training precision: %s | device: %s | z_loss_weight: %g",
+            effective_precision,
+            device,
+            config.z_loss_weight,
+        )
+
         model = model.to(device)
         optimizer = build_optimizer(model, config)
 
@@ -357,7 +433,15 @@ class Trainer:
                 x, y = next(train_iter)
 
                 step_start = time.perf_counter()
-                train_loss, aux_loss_value, grad_norm, current_lr, device, model = _run_step(
+                (
+                    train_loss,
+                    aux_loss_value,
+                    z_loss_value,
+                    grad_norm,
+                    current_lr,
+                    device,
+                    model,
+                ) = _run_step(
                     model,
                     optimizer,
                     x,
@@ -375,11 +459,12 @@ class Trainer:
 
                 if global_step % config.log_interval_steps == 0 or is_last_step:
                     logger.info(
-                        "step %d/%d | loss %.4f | aux_loss %s | lr %.2e | elapsed %.3fs",
+                        "step %d/%d | loss %.4f | aux_loss %s | z_loss %s | lr %.2e | elapsed %.3fs",
                         global_step,
                         total_steps,
                         train_loss,
                         "n/a" if aux_loss_value is None else f"{aux_loss_value:.4f}",
+                        "n/a" if z_loss_value is None else f"{z_loss_value:.4f}",
                         current_lr,
                         elapsed,
                     )
@@ -390,6 +475,7 @@ class Trainer:
                             "step": global_step,
                             "train_loss": train_loss,
                             "aux_loss": aux_loss_value,
+                            "z_loss": z_loss_value,
                             "lr": current_lr,
                             "grad_norm": grad_norm,
                             "elapsed_s": elapsed,
