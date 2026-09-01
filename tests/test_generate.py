@@ -2,7 +2,13 @@ import pytest
 import torch
 
 from qwenmoe.config import ModelConfig
-from qwenmoe.model.generate import filter_top_k, filter_top_p, generate
+from qwenmoe.model.generate import (
+    apply_repetition_penalty,
+    filter_min_p,
+    filter_top_k,
+    filter_top_p,
+    generate,
+)
 from qwenmoe.model.transformer import QwenMoEModel
 from qwenmoe.tokenizer.char import CharTokenizer
 
@@ -236,6 +242,113 @@ def test_generate_default_device_is_cpu():
     model, tokenizer = _tiny_setup()
     out = generate(model, tokenizer, "hello", max_new_tokens=5)
     assert isinstance(out, str)
+
+
+# -- filter_min_p (moe-modernization Requirement 11.1) --------------------
+
+
+def test_filter_min_p_keeps_tokens_above_relative_threshold():
+    # probs ~ [0.475, 0.475, 0.047, 0.003]; p_max ~ 0.475
+    logits = torch.tensor([[3.0, 3.0, 0.7, -2.0]])
+    filtered = filter_min_p(logits, min_p=0.05)  # threshold ~ 0.024
+
+    assert filtered[0, 0] == 3.0 and filtered[0, 1] == 3.0
+    assert filtered[0, 2] == 0.7  # prob 0.047 > 0.024 -> kept
+    assert torch.isinf(filtered[0, 3]) and filtered[0, 3] < 0  # prob 0.003 < 0.024 -> dropped
+
+
+def test_filter_min_p_is_adaptive_confident_vs_flat():
+    """A peaked distribution keeps few tokens; a flat one keeps many --
+    the whole point of min-p vs top-p's fixed mass."""
+    peaked = torch.tensor([[8.0, 1.0, 1.0, 1.0, 1.0]])
+    flat = torch.tensor([[0.1, 0.0, 0.0, -0.1, 0.05]])
+
+    n_peaked = torch.isfinite(filter_min_p(peaked, 0.2)).sum().item()
+    n_flat = torch.isfinite(filter_min_p(flat, 0.2)).sum().item()
+    assert n_peaked < n_flat
+
+
+def test_filter_min_p_never_masks_every_token():
+    for logits in (torch.tensor([[5.0, -5.0, -5.0]]), torch.zeros(1, 6)):
+        assert torch.isfinite(filter_min_p(logits, min_p=1.0)).any()
+
+
+def test_filter_min_p_rejects_out_of_range():
+    for bad in (0.0, -0.1, 1.5):
+        with pytest.raises(ValueError):
+            filter_min_p(torch.zeros(1, 3), bad)
+
+
+# -- apply_repetition_penalty (Requirement 11.2) -------------------------
+
+
+def test_repetition_penalty_lowers_probability_of_seen_tokens():
+    logits = torch.tensor([[2.0, -1.0, 0.5, 3.0]])
+    generated = torch.tensor([0, 1])  # tokens 0 (positive logit) and 1 (negative) seen
+
+    penalized = apply_repetition_penalty(logits, generated, penalty=2.0)
+
+    p_before = torch.softmax(logits, dim=-1)
+    p_after = torch.softmax(penalized, dim=-1)
+    assert p_after[0, 0] < p_before[0, 0]  # positive logit divided down
+    assert p_after[0, 1] < p_before[0, 1]  # negative logit multiplied more negative
+    assert p_after[0, 2] > p_before[0, 2]  # unseen token's share rises
+    assert p_after[0, 3] > p_before[0, 3]
+
+
+def test_repetition_penalty_of_one_is_a_no_op():
+    logits = torch.randn(1, 8)
+    assert torch.equal(apply_repetition_penalty(logits, torch.tensor([1, 3]), 1.0), logits)
+
+
+def test_repetition_penalty_rejects_non_positive():
+    with pytest.raises(ValueError):
+        apply_repetition_penalty(torch.zeros(1, 4), torch.tensor([0]), penalty=0.0)
+
+
+# -- generate() integration (Requirement 11.3, 11.4) --------------------
+
+
+def test_generate_neutral_min_p_and_rep_penalty_is_identical_to_today():
+    """Requirement 11.3: default `min_p=None`, `repetition_penalty=1.0` ->
+    byte-identical greedy output."""
+    model, tokenizer = _tiny_setup()
+    a = generate(model, tokenizer, "hello", max_new_tokens=12, temperature=0.0)
+    b = generate(
+        model, tokenizer, "hello", max_new_tokens=12, temperature=0.0,
+        min_p=None, repetition_penalty=1.0,
+    )
+    assert a == b
+
+
+def test_generate_repetition_penalty_changes_greedy_output_toward_less_repetition():
+    """A strong repetition penalty must actually alter a greedy run (it is
+    applied to the raw logits, so it affects argmax too)."""
+    torch.manual_seed(0)
+    model, tokenizer = _tiny_setup()
+    plain = generate(model, tokenizer, "abc", max_new_tokens=20, temperature=0.0)
+    penalized = generate(
+        model, tokenizer, "abc", max_new_tokens=20, temperature=0.0, repetition_penalty=2.0
+    )
+    assert plain != penalized
+    assert len(set(penalized)) >= len(set(plain))  # at least as many distinct chars
+
+
+def test_generate_min_p_composes_with_top_k_and_never_stalls():
+    model, tokenizer = _tiny_setup(max_seq_len=40)
+    out = generate(
+        model, tokenizer, "hello", max_new_tokens=15,
+        temperature=1.0, top_k=8, top_p=0.95, min_p=0.05,
+    )
+    assert isinstance(out, str) and len(out) == len("hello") + 15
+
+
+def test_generate_rejects_bad_min_p_and_repetition_penalty():
+    model, tokenizer = _tiny_setup()
+    with pytest.raises(ValueError):
+        generate(model, tokenizer, "hi", max_new_tokens=1, min_p=1.5)
+    with pytest.raises(ValueError):
+        generate(model, tokenizer, "hi", max_new_tokens=1, repetition_penalty=-1.0)
 
 
 def test_generate_use_kv_cache_composes_with_sampling_filters():

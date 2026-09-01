@@ -50,16 +50,74 @@ def filter_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
     return filtered
 
 
+def filter_min_p(logits: torch.Tensor, min_p: float) -> torch.Tensor:
+    """min-p sampling (Nguyen et al., 2024): keep only tokens whose
+    probability is at least `min_p` times the single most likely token's
+    probability; `-inf` the rest.
+
+    Adaptive where top-p is fixed: when the model is confident (one token
+    holds most of the mass) the threshold `min_p · p_max` is high and only
+    a few tokens survive; when it's unsure (a flat distribution) `p_max` is
+    small so the threshold is low and many tokens survive. Since `min_p <=
+    1`, the argmax always clears its own threshold, so the result never
+    masks every token (Requirement 11.1, 11.4). Standalone and mirroring
+    `filter_top_k`/`filter_top_p` so it's testable on hand-built logits.
+    """
+    if not (0.0 < min_p <= 1.0):
+        raise ValueError(f"min_p must be in (0, 1], got {min_p}")
+    probs = F.softmax(logits, dim=-1)
+    threshold = min_p * probs.max(dim=-1, keepdim=True).values
+    return torch.where(probs < threshold, torch.full_like(logits, float("-inf")), logits)
+
+
+def apply_repetition_penalty(
+    logits: torch.Tensor, generated_ids: torch.Tensor, penalty: float
+) -> torch.Tensor:
+    """CTRL-style repetition penalty (Keskar et al., 2019): push the logit
+    of every token id that already appears in `generated_ids` toward
+    `-inf` by a factor of `penalty` (`> 1` discourages repeats, `1.0` is a
+    no-op).
+
+    Sign-aware, per the CTRL / Hugging Face implementation: a *positive*
+    seen-token logit is **divided** by `penalty` (shrinks toward 0), a
+    *negative* one is **multiplied** (grows more negative). Both lower that
+    token's probability -- a naive "always divide" would instead *raise*
+    the probability of a seen token whose logit is negative, which is the
+    opposite of the intent behind Requirement 11.2.
+    """
+    if penalty <= 0:
+        raise ValueError(f"repetition_penalty must be > 0, got {penalty}")
+    if penalty == 1.0:
+        return logits
+    seen = torch.unique(generated_ids)
+    logits = logits.clone()
+    current = logits[..., seen]
+    logits[..., seen] = torch.where(current > 0, current / penalty, current * penalty)
+    return logits
+
+
 def _sample_next(
     next_logits: torch.Tensor,
     temperature: float,
     top_k: int | None,
     top_p: float | None,
+    min_p: float | None = None,
+    repetition_penalty: float = 1.0,
+    generated_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """`(batch, vocab)` last-position logits -> `(batch, 1)` next token id.
-    `temperature <= 0` is deterministic greedy (argmax); otherwise scale,
-    optionally `top_k`/`top_p` filter, softmax, multinomial-sample. Shared
-    verbatim by the cached and uncached decode loops so they can't drift."""
+
+    The repetition penalty (if any) is applied to the raw logits first, so
+    it shapes greedy decoding too. Then `temperature <= 0` is deterministic
+    greedy (argmax); otherwise scale by temperature and apply
+    `top_k` -> `top_p` -> `min_p` in sequence -- each further restricts the
+    surviving candidate set (Requirement 11.4) and every one keeps at least
+    the argmax, so the set is never empty -- then softmax + multinomial.
+    Shared verbatim by the cached and uncached decode loops so they can't
+    drift.
+    """
+    if repetition_penalty != 1.0 and generated_ids is not None:
+        next_logits = apply_repetition_penalty(next_logits, generated_ids, repetition_penalty)
     if temperature <= 0:
         return torch.argmax(next_logits, dim=-1, keepdim=True)
     scaled_logits = next_logits / temperature
@@ -67,6 +125,8 @@ def _sample_next(
         scaled_logits = filter_top_k(scaled_logits, top_k)
     if top_p is not None:
         scaled_logits = filter_top_p(scaled_logits, top_p)
+    if min_p is not None:
+        scaled_logits = filter_min_p(scaled_logits, min_p)
     probs = F.softmax(scaled_logits, dim=-1)
     return torch.multinomial(probs, num_samples=1)
 
@@ -80,6 +140,8 @@ def generate(
     temperature: float = 1.0,
     top_k: int | None = None,
     top_p: float | None = None,
+    min_p: float | None = None,
+    repetition_penalty: float = 1.0,
     device: str = "cpu",
     use_kv_cache: bool = False,
 ) -> str:
@@ -100,6 +162,13 @@ def generate(
     (each token still attends over the identical prefix at its true
     positions), so greedy decoding produces an identical token sequence
     (Requirement 8.2).
+
+    `min_p` and `repetition_penalty` (moe-modernization Requirement 11):
+    `min_p` keeps only tokens with probability `>= min_p * p_max` (an
+    adaptive alternative to `top_p`), composing after `top_k`/`top_p`;
+    `repetition_penalty > 1.0` pushes down the logits of tokens already in
+    the sequence. Both neutral by default (`None` / `1.0`) -> generation is
+    identical to before this task (Requirement 11.3).
     """
     if max_new_tokens < 0:
         raise ValueError(f"max_new_tokens must be >= 0, got {max_new_tokens}")
@@ -109,6 +178,10 @@ def generate(
         raise ValueError(f"top_k must be >= 1, got {top_k}")
     if top_p is not None and not (0.0 < top_p <= 1.0):
         raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+    if min_p is not None and not (0.0 < min_p <= 1.0):
+        raise ValueError(f"min_p must be in (0, 1], got {min_p}")
+    if repetition_penalty <= 0:
+        raise ValueError(f"repetition_penalty must be > 0, got {repetition_penalty}")
 
     token_ids = tokenizer.encode(prompt)
     if len(token_ids) == 0:
@@ -134,7 +207,10 @@ def generate(
                 sequence[:, -1:], kv_caches=caches, position_offset=sequence.size(1) - 1
             )
 
-        next_token = _sample_next(logits[:, -1, :], temperature, top_k, top_p)
+        next_token = _sample_next(
+            logits[:, -1, :], temperature, top_k, top_p,
+            min_p=min_p, repetition_penalty=repetition_penalty, generated_ids=sequence,
+        )
         sequence = torch.cat([sequence, next_token], dim=1)
 
     return tokenizer.decode(sequence[0].tolist())

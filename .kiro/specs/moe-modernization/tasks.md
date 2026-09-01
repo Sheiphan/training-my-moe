@@ -180,7 +180,7 @@
     shapes, DeepSeek-V2 link, a worked cache-growth table.
   - _Requirements: 8.1, 8.2, 8.3, 8.4_
 
-- [ ] 14. Inference sampling: min-p + repetition penalty
+- [x] 14. Inference sampling: min-p + repetition penalty
   - `filter_min_p`, `apply_repetition_penalty` in `generate.py`, mirroring
     the existing filters; new `generate()` params compose with
     `top_k`/`top_p`.
