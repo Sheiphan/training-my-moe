@@ -3,6 +3,8 @@ a final norm, and a (optionally tied) LM head (Requirement 1.1, 1.2, 1.7).
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,11 +14,19 @@ from qwenmoe.model.block import TransformerBlock
 from qwenmoe.model.rmsnorm import RMSNorm
 from qwenmoe.model.trace import LayerTrace, TraceBundle
 
-# GPT-2-style embedding init (Radford et al., 2019); PyTorch's nn.Embedding
-# default (N(0, 1)) is ~50x too large and, when tied to the LM head
-# (Requirement 1.7's default), blows up output logits before any training
-# happens -- found while validating task 10's training loop (see journal).
-_EMBEDDING_INIT_STD = 0.02
+# Names of the residual-path *output* projections -- the linears that write
+# a block's contribution back into the residual stream. Their init std is
+# additionally divided by sqrt(2 * n_layers) (moe-modernization Requirement
+# 9.2, the GPT-2/Llama residual-scaling rule -- see journal entry 023).
+# `w_o`: Attention / MLAAttention output projection; `w_down`: SwiGLU/GEGLU
+# expert down-projection; `w_2`: plain-GELU expert down-projection.
+_RESIDUAL_PROJ_SUFFIXES = ("w_o.weight", "w_down.weight", "w_2.weight")
+
+
+def _trunc_normal_(tensor: torch.Tensor, std: float) -> None:
+    """Truncated-normal init at the given std, clipped at +/-2 std (the
+    GPT-2/T5 convention). In place."""
+    nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std)
 
 
 class QwenMoEModel(nn.Module):
@@ -30,12 +40,38 @@ class QwenMoEModel(nn.Module):
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=_EMBEDDING_INIT_STD)
         self.blocks = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layers))
         self.final_norm = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embedding.weight  # Requirement 1.7
+
+        # Principled init (moe-modernization Requirement 9): truncated
+        # normal at `init_std` for every linear + the embedding (replacing
+        # PyTorch's default Kaiming-uniform on the linears), then a second
+        # pass scaling the residual-path output projections down by
+        # 1/sqrt(2 * n_layers). RMSNorm gains keep their all-ones init.
+        self.apply(self._init_weights)
+        residual_std = config.init_std / math.sqrt(2 * config.n_layers)
+        for name, param in self.named_parameters():
+            if name.endswith(_RESIDUAL_PROJ_SUFFIXES):
+                _trunc_normal_(param, residual_std)
+
+    def _init_weights(self, module: nn.Module) -> None:
+        """Called on every submodule by `self.apply`. A tied LM head
+        (`lm_head.weight is embedding.weight`) is skipped here so it keeps
+        exactly the embedding's init, not a second linear-style
+        re-init (Requirement 9.3) -- harmless in practice since both use
+        the same `init_std`, but explicit so the intent is unambiguous.
+        """
+        if isinstance(module, nn.Linear):
+            if module is self.lm_head and self.config.tie_word_embeddings:
+                return
+            _trunc_normal_(module.weight, self.config.init_std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            _trunc_normal_(module.weight, self.config.init_std)
 
     def forward(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, dict]:
         seq_len = input_ids.shape[1]

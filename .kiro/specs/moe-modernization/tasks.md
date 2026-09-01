@@ -87,7 +87,7 @@
     Gemma link, a worked before/after logit-scale example.
   - _Requirements: 7.3, 7.5_
 
-- [ ] 7. Principled initialization
+- [x] 7. Principled initialization
   - `QwenMoEModel._init_weights` via `self.apply`: truncated-normal linears
     at `init_std`; residual-path projections (`w_o`, expert down-proj) scaled
     by `1/sqrt(2·n_layers)`; embedding unchanged; tied head skipped.

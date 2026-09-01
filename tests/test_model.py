@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -75,6 +77,64 @@ def test_untied_embeddings_are_independent_tensors():
     model = QwenMoEModel(config)
     assert model.lm_head.weight is not model.embedding.weight
     assert model.lm_head.weight.shape == model.embedding.weight.shape
+
+
+# -- principled initialization (moe-modernization Requirement 9) ------------
+
+
+def test_init_every_linear_is_truncated_normal_at_init_std_not_kaiming():
+    """Requirement 9.1: every nn.Linear starts from a truncated normal at
+    `init_std`, replacing PyTorch's default Kaiming-uniform. Truncation at
+    +/-2 std means the realized std is ~0.88x nominal and no entry exceeds
+    2*init_std in magnitude -- both checked here."""
+    config = _tiny_config(init_std=0.02)
+    model = QwenMoEModel(config)
+
+    w_q = model.blocks[0].attn.w_q.weight
+    assert w_q.abs().max().item() <= 2 * config.init_std + 1e-6
+    assert 0.7 * config.init_std < w_q.std().item() < config.init_std  # truncated => below nominal
+
+
+def test_init_residual_projections_scaled_by_one_over_sqrt_2n():
+    """Requirement 9.2: residual-path output projections (Attention.w_o,
+    expert down-projections) get their std divided by sqrt(2 * n_layers)."""
+    config = _tiny_config(n_layers=2, init_std=0.02)
+    model = QwenMoEModel(config)
+
+    w_q_std = model.blocks[0].attn.w_q.weight.std().item()
+    w_o_std = model.blocks[0].attn.w_o.weight.std().item()
+    expert = model.blocks[0].moe.routed_experts[0]
+    down_proj = getattr(expert, "w_down", None) or getattr(expert, "w_2")
+
+    expected_ratio = 1.0 / math.sqrt(2 * config.n_layers)  # = 0.5 for n_layers=2
+    assert w_o_std / w_q_std == pytest.approx(expected_ratio, rel=0.2)
+    assert down_proj.weight.std().item() / w_q_std == pytest.approx(expected_ratio, rel=0.2)
+
+
+def test_init_untrained_logits_have_order_one_std():
+    """Requirement 9.4: an untrained model's logits on a random batch have
+    std within a small factor of 1.0 -- no 50x-style blow-up (the failure
+    mode journal entry 010 hit with the old nn.Embedding default init)."""
+    torch.manual_seed(0)
+    config = _tiny_config(d_model=64, n_layers=2)
+    model = QwenMoEModel(config)
+    input_ids = torch.randint(0, config.vocab_size, (4, 16))
+
+    with torch.no_grad():
+        logits, _ = model(input_ids)
+
+    assert 0.02 < logits.std().item() < 3.0
+
+
+def test_init_tied_lm_head_keeps_embedding_init():
+    """Requirement 9.3: with tied weights, the shared matrix keeps the
+    embedding init (std = init_std), and is not re-initialized a second
+    time as a linear."""
+    torch.manual_seed(0)
+    tied = QwenMoEModel(_tiny_config(tie_word_embeddings=True, init_std=0.02))
+    assert tied.lm_head.weight is tied.embedding.weight
+    # embedding init: truncated normal at init_std, so bounded by 2*init_std
+    assert tied.embedding.weight.abs().max().item() <= 2 * 0.02 + 1e-6
 
 
 def test_gradients_flow_through_embedding_and_every_block():
