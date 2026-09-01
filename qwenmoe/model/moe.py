@@ -238,6 +238,47 @@ class LossFreeBalancer(nn.Module):
         load balance with no gradient-based loss term (Requirement 12.3)."""
         return None
 
+    def sequence_balance_loss(
+        self,
+        routing_probs: torch.Tensor,
+        topk_indices: torch.Tensor,
+        seq_len: int,
+        top_k: int,
+        weight: float,
+    ) -> torch.Tensor:
+        """DeepSeek-V3's **complementary per-sequence** balance loss
+        (arXiv:2412.19437 Eq. 17-19), moe-modernization Requirement 4.4.
+
+        The bias update above balances load *in aggregate*; it can't stop a
+        single sequence from routing all of its own tokens to one expert as
+        long as the rest of the batch compensates. This term restores a
+        tiny gradient-based pressure computed **within each sequence
+        separately**, then averaged over the batch, so per-sequence routing
+        collapse is still penalized.
+
+        - `routing_probs`: `(batch * seq_len, n_experts)` normalized
+          affinities `s'_{i,t}` (from `score_and_select`).
+        - `topk_indices`: `(batch * seq_len, top_k)` selected expert ids.
+        - tokens are laid out row-major, so `batch = n_tokens // seq_len`.
+
+        Per sequence, with `T = seq_len`, `K_r = top_k`, `N_r = n_experts`:
+        `f_i = (N_r / (K_r · T)) · Σ_t 1(token t picks expert i)` (sums to
+        `N_r`), `P_i = (1/T) Σ_t s'_{i,t}` (sums to 1); the penalty is
+        `weight · mean_seq( Σ_i f_i · P_i )`, whose minimum (`weight · 1`)
+        is reached only when every sequence is internally balanced.
+        """
+        n_experts = self.n_routed_experts
+        batch = routing_probs.shape[0] // seq_len
+
+        dispatched = F.one_hot(topk_indices, num_classes=n_experts).sum(dim=1)
+        dispatched = dispatched.reshape(batch, seq_len, n_experts).float()
+        probs = routing_probs.reshape(batch, seq_len, n_experts)
+
+        f_i = (n_experts / (top_k * seq_len)) * dispatched.sum(dim=1)  # (batch, n_experts)
+        p_i = probs.mean(dim=1)  # (batch, n_experts)
+        per_sequence = (f_i * p_i).sum(dim=-1)  # (batch,) -- == 1 at perfect balance
+        return weight * per_sequence.mean()
+
     @torch.no_grad()
     def update(self, expert_counts: torch.Tensor) -> None:
         """Nudges each expert's bias by a fixed step `update_rate`, in the
@@ -283,6 +324,8 @@ class MoELayer(nn.Module):
         # bit-identically to today.
         self.router_scoring = config.router_scoring
         self.router_z_loss_weight = config.router_z_loss_weight
+        # Requirement 4.4: only consulted with the loss-free balancer; 0 == off.
+        self.seq_balance_loss_weight = config.seq_balance_loss_weight
 
         self.router = Router(config.d_model, config.n_routed_experts)
         self.routed_experts = nn.ModuleList(
@@ -335,7 +378,32 @@ class MoELayer(nn.Module):
         output = (routed_output + shared_output).view(batch, seq_len, d_model)
         aux_loss = self.balancer.aux_loss(routing_probs, topk_indices)
         aux_loss = self._add_router_z_loss(aux_loss, router_logits)
+        aux_loss = self._add_seq_balance_loss(aux_loss, routing_probs, topk_indices, seq_len)
         return output, aux_loss
+
+    def _add_seq_balance_loss(
+        self,
+        aux_loss: torch.Tensor | None,
+        routing_probs: torch.Tensor,
+        topk_indices: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor | None:
+        """Requirement 4.4: fold DeepSeek-V3's complementary per-sequence
+        balance loss into the aux-loss total, at `seq_balance_loss_weight`.
+        Only the loss-free balancer provides `sequence_balance_loss` (the
+        aux-loss balancer already has a batch-wide term), so this is a no-op
+        for `moe_balancing == "aux_loss"` and when the weight is `0` (the
+        default) -- both keep the pre-spec aux loss bit-identical.
+        """
+        if self.seq_balance_loss_weight <= 0:
+            return aux_loss
+        seq_balance_loss = getattr(self.balancer, "sequence_balance_loss", None)
+        if seq_balance_loss is None:
+            return aux_loss
+        sb = seq_balance_loss(
+            routing_probs, topk_indices, seq_len, self.top_k, self.seq_balance_loss_weight
+        )
+        return sb if aux_loss is None else aux_loss + sb
 
     def _add_router_z_loss(
         self, aux_loss: torch.Tensor | None, router_logits: torch.Tensor
@@ -391,6 +459,7 @@ class MoELayer(nn.Module):
         output = (routed_output + shared_output).view(batch, seq_len, d_model)
         aux_loss = self.balancer.aux_loss(routing_probs, topk_indices)
         aux_loss = self._add_router_z_loss(aux_loss, router_logits)
+        aux_loss = self._add_seq_balance_loss(aux_loss, routing_probs, topk_indices, seq_len)
 
         trace = {
             "router_logits": router_logits,

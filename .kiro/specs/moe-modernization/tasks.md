@@ -121,7 +121,7 @@
     flow), router z-loss, DeepSeek-V3 link, worked routing example.
   - _Requirements: 4.1, 4.2, 4.3, 4.5, 4.6_
 
-- [ ] 10. MoE routing: loss-free complementary sequence-balance loss
+- [x] 10. MoE routing: loss-free complementary sequence-balance loss
   - `LossFreeBalancer.sequence_balance_loss(...)`, added at
     `seq_balance_loss_weight` when `> 0`; surfaced in the aux-loss total and
     the step log.

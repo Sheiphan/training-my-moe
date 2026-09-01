@@ -447,3 +447,95 @@ def test_aux_loss_weight_is_config_driven():
     hard-coded literal."""
     assert MoELayer(_tiny_config()).balancer.loss_weight == pytest.approx(0.01)
     assert MoELayer(_tiny_config(aux_loss_weight=0.05)).balancer.loss_weight == pytest.approx(0.05)
+
+
+# -- loss-free complementary per-sequence balance loss (Requirement 4.4) ----
+
+
+def _collapsed_and_balanced_routing(n_experts=2, seq_len=4, top_k=1):
+    """Two 1-token-per-expert layouts for the same batch shape:
+    `collapsed` -- sequence 0's tokens all pick expert 0, sequence 1's all
+    pick expert 1 (batch-wide this looks perfectly balanced); `balanced` --
+    every sequence cycles through the experts internally.
+    """
+    peak0 = torch.tensor([0.7, 0.3]) if n_experts == 2 else None
+    collapsed_idx = torch.cat(
+        [torch.zeros(seq_len, top_k), torch.ones(seq_len, top_k)]
+    ).long()
+    collapsed_probs = torch.cat(
+        [peak0.repeat(seq_len, 1), peak0.flip(0).repeat(seq_len, 1)]
+    )
+    cycle = torch.arange(seq_len).remainder(n_experts)
+    balanced_idx = torch.cat([cycle, cycle]).unsqueeze(-1)
+    balanced_probs = torch.full((2 * seq_len, n_experts), 1.0 / n_experts)
+    return (collapsed_idx, collapsed_probs), (balanced_idx, balanced_probs)
+
+
+def test_sequence_balance_loss_zero_weight_keeps_loss_free_aux_loss_none():
+    """Requirement 4.4 invariant: with `seq_balance_loss_weight == 0` (the
+    default) a loss-free MoE layer still reports no aux loss at all."""
+    torch.manual_seed(0)
+    moe = MoELayer(_tiny_config(moe_balancing="loss_free"))
+    _, aux_loss = moe(torch.randn(2, 5, moe.router.gate.in_features))
+    assert aux_loss is None
+
+
+def test_sequence_balance_loss_penalizes_a_collapsed_sequence():
+    """A single sequence routing every token to one expert scores well
+    above the `weight * 1.0` floor."""
+    balancer = LossFreeBalancer(n_routed_experts=2)
+    (c_idx, c_probs), (b_idx, b_probs) = _collapsed_and_balanced_routing()
+
+    collapsed = balancer.sequence_balance_loss(c_probs, c_idx, seq_len=4, top_k=1, weight=1.0)
+    balanced = balancer.sequence_balance_loss(b_probs, b_idx, seq_len=4, top_k=1, weight=1.0)
+
+    assert balanced == pytest.approx(1.0, abs=1e-5)  # the minimum
+    assert collapsed == pytest.approx(1.4, abs=1e-5)  # 2 * 0.7
+    assert collapsed > balanced
+
+
+def test_sequence_balance_loss_catches_batch_balanced_but_sequence_imbalanced():
+    """The whole point of Requirement 4.4: the batch-wide Switch loss is at
+    its floor for a batch where sequence 0 -> expert 0 and sequence 1 ->
+    expert 1 (50/50 overall), but the per-sequence loss is not."""
+    (c_idx, c_probs), _ = _collapsed_and_balanced_routing()
+
+    switch = AuxLossBalancer(n_routed_experts=2).aux_loss(c_probs, c_idx)  # batch-wide
+    per_seq = LossFreeBalancer(n_routed_experts=2).sequence_balance_loss(
+        c_probs, c_idx, seq_len=4, top_k=1, weight=0.01
+    )
+
+    # Switch sees f_i = [0.5, 0.5], P_i = [0.5, 0.5] -> its floor (weight * top_k)
+    assert switch == pytest.approx(0.01 * 1, abs=1e-6)
+    assert per_seq > 0.01 * 1.0  # per-sequence still flags the collapse
+
+
+def test_sequence_balance_loss_only_applies_with_the_loss_free_balancer():
+    """Requirement 4.4 is gated on `moe_balancing == "loss_free"`: an
+    aux-loss layer ignores `seq_balance_loss_weight` entirely."""
+    torch.manual_seed(0)
+    plain = MoELayer(_tiny_config())
+    with_weight = MoELayer(_tiny_config(seq_balance_loss_weight=0.1))
+    with_weight.load_state_dict(plain.state_dict())
+    x = torch.randn(2, 5, plain.router.gate.in_features)
+
+    _, aux_plain = plain(x)
+    _, aux_with_weight = with_weight(x)
+    assert torch.equal(aux_plain, aux_with_weight)
+
+
+def test_moe_layer_seq_balance_loss_reaches_the_aux_total_and_keeps_bias_gradient_free():
+    """Requirement 4.4 + 12.3: the per-sequence loss shows up in a loss-free
+    layer's aux total, and the loss-free bias buffer still never gets a
+    gradient from it."""
+    torch.manual_seed(0)
+    config = _tiny_config(moe_balancing="loss_free", seq_balance_loss_weight=0.05)
+    moe = MoELayer(config)
+    x = torch.randn(2, 5, config.d_model)
+
+    out, aux_loss = moe(x)
+    assert aux_loss is not None and torch.isfinite(aux_loss) and aux_loss > 0.0
+
+    (out.sum() + aux_loss).backward()
+    assert moe.balancer.bias.grad is None
+    assert moe.router.gate.weight.grad is not None  # the term does train the router
