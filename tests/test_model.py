@@ -137,6 +137,36 @@ def test_init_tied_lm_head_keeps_embedding_init():
     assert tied.embedding.weight.abs().max().item() <= 2 * 0.02 + 1e-6
 
 
+@pytest.mark.parametrize("router_scoring", ["softmax", "sigmoid"])
+def test_model_trains_a_few_steps_with_each_router_scoring(router_scoring):
+    """moe-modernization Requirement 4.1/4.6: a full model with sigmoid
+    routing (and a router z-loss) does a forward+backward with finite loss
+    and a shrinking loss over a handful of manual steps."""
+    torch.manual_seed(0)
+    config = _tiny_config(
+        d_model=32, router_scoring=router_scoring, router_z_loss_weight=1e-3
+    )
+    model = QwenMoEModel(config)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    input_ids = torch.randint(0, config.vocab_size, (4, 8))
+    targets = torch.randint(0, config.vocab_size, (4, 8))
+
+    losses = []
+    for _ in range(15):
+        logits, extras = model(input_ids)
+        ce = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, config.vocab_size), targets.reshape(-1)
+        )
+        total = ce + extras["aux_loss"]
+        opt.zero_grad()
+        total.backward()
+        opt.step()
+        losses.append(ce.item())
+
+    assert all(math.isfinite(v) for v in losses)
+    assert losses[-1] < losses[0]
+
+
 def test_gradients_flow_through_embedding_and_every_block():
     config = _tiny_config()
     model = QwenMoEModel(config)

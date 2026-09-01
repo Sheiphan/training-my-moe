@@ -1,8 +1,16 @@
 import pytest
 import torch
+import torch.nn.functional as F
 
 from qwenmoe.config import ModelConfig
-from qwenmoe.model.moe import AuxLossBalancer, LossFreeBalancer, MoELayer, Router, select_top_k
+from qwenmoe.model.moe import (
+    AuxLossBalancer,
+    LossFreeBalancer,
+    MoELayer,
+    Router,
+    score_and_select,
+    select_top_k,
+)
 
 
 def _tiny_config(**overrides):
@@ -279,3 +287,163 @@ def test_moe_layer_loss_free_bias_never_receives_a_gradient():
     output.sum().backward()
 
     assert moe.balancer.bias.grad is None
+
+
+# -- routing modernization (moe-modernization Requirement 4.1-4.3, 4.5, 4.6) --
+
+
+def test_score_and_select_softmax_is_identical_to_the_pre_spec_path():
+    """Requirement 4.2: `scoring="softmax"` reproduces exactly what the
+    old inline `F.softmax` + `balancer.selection_scores` + `select_top_k`
+    produced."""
+    torch.manual_seed(0)
+    logits = torch.randn(6, 5)
+    balancer = AuxLossBalancer(n_routed_experts=5)
+
+    ref_probs = F.softmax(logits, dim=-1)
+    ref_idx, ref_w = select_top_k(logits, ref_probs, top_k=2)
+
+    idx, w, routing_probs = score_and_select(logits, balancer, top_k=2, scoring="softmax")
+
+    assert torch.equal(idx, ref_idx)
+    assert torch.equal(w, ref_w)
+    assert torch.equal(routing_probs, ref_probs)
+
+
+def test_score_and_select_sigmoid_selects_exactly_k_and_weights_sum_to_one():
+    """Requirement 4.1, 4.6: sigmoid scoring still picks k distinct experts
+    and the combination weights still sum to 1."""
+    torch.manual_seed(1)
+    n_tokens, n_experts, k = 7, 6, 3
+    logits = torch.randn(n_tokens, n_experts)
+    balancer = AuxLossBalancer(n_routed_experts=n_experts)
+
+    idx, w, routing_probs = score_and_select(logits, balancer, top_k=k, scoring="sigmoid")
+
+    assert idx.shape == (n_tokens, k)
+    for row in idx:
+        assert len(set(row.tolist())) == k
+    assert torch.allclose(w.sum(dim=-1), torch.ones(n_tokens), atol=1e-5)
+    assert torch.allclose(routing_probs.sum(dim=-1), torch.ones(n_tokens), atol=1e-5)
+
+
+def test_score_and_select_sigmoid_weights_are_normalized_selected_affinities():
+    """Requirement 4.1: sigmoid combination weights are the selected
+    `sigmoid(logit)` affinities renormalized to sum to 1 (the global
+    normalizer cancels)."""
+    logits = torch.tensor([[2.0, 1.0, 0.0, -1.0]])
+    balancer = AuxLossBalancer(n_routed_experts=4)
+
+    idx, w, _ = score_and_select(logits, balancer, top_k=2, scoring="sigmoid")
+
+    aff = torch.sigmoid(logits)[0]
+    top2 = aff.topk(2).values
+    expected = top2 / top2.sum()
+    assert set(idx[0].tolist()) == {0, 1}
+    assert torch.allclose(w[0].sort(descending=True).values, expected, atol=1e-6)
+
+
+def test_score_and_select_sigmoid_and_softmax_can_disagree_with_loss_free_bias():
+    """Requirement 4.1 vs 4.2: with the loss-free bias in play, sigmoid and
+    softmax scoring are genuinely different selection rules (the bias breaks
+    softmax's cross-expert monotonicity)."""
+    torch.manual_seed(0)
+    logits = torch.randn(32, 8)
+    balancer = LossFreeBalancer(n_routed_experts=8)
+    balancer.bias.copy_(torch.linspace(-0.3, 0.3, 8))
+
+    soft_idx, _, _ = score_and_select(logits, balancer, top_k=3, scoring="softmax")
+    sig_idx, _, _ = score_and_select(logits, balancer, top_k=3, scoring="sigmoid")
+
+    assert not torch.equal(soft_idx, sig_idx)
+
+
+def test_score_and_select_rejects_unknown_scoring():
+    with pytest.raises(ValueError, match="router_scoring"):
+        score_and_select(torch.randn(2, 4), AuxLossBalancer(4), top_k=2, scoring="nope")
+
+
+def test_moe_layer_sigmoid_routing_runs_and_skips_zero_token_experts():
+    """Requirement 4.6: with more experts than a small batch can cover,
+    some get zero tokens -- the layer must still produce a finite output of
+    the right shape and no error."""
+    torch.manual_seed(0)
+    config = _tiny_config(n_routed_experts=8, top_k=2, router_scoring="sigmoid")
+    moe = MoELayer(config)
+    x = torch.randn(1, 3, config.d_model)  # 3 tokens, 8 experts -> guaranteed idle experts
+
+    out, aux_loss = moe(x)
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(aux_loss)
+    assert (moe.last_expert_counts == 0).any()
+
+
+def test_router_z_loss_zero_leaves_aux_loss_identical():
+    """Requirement 4.3 invariant: `router_z_loss_weight == 0` (default) ⇒
+    the MoE aux loss is byte-identical to the balancer's own aux loss."""
+    torch.manual_seed(0)
+    config = _tiny_config()
+    moe = MoELayer(config)
+    x = torch.randn(2, 5, config.d_model)
+
+    _, aux_loss = moe(x)
+
+    # recompute the balancer's aux loss directly from the same forward
+    router_logits = moe.router(x.reshape(-1, config.d_model))
+    idx, _, routing_probs = score_and_select(
+        router_logits, moe.balancer, config.top_k, "softmax"
+    )
+    ref = moe.balancer.aux_loss(routing_probs, idx)
+    assert torch.equal(aux_loss, ref)
+
+
+def test_router_z_loss_positive_adds_a_nonnegative_term_that_tracks_logit_scale():
+    """Requirement 4.3: the term is `weight * mean(logsumexp(router_logits)^2)`
+    -- non-negative, and larger when the router logits blow up."""
+    torch.manual_seed(0)
+    weight = 1e-2
+
+    small = torch.zeros(4, 6)
+    big = torch.randn(4, 6) * 20.0
+
+    def rz(logits):
+        return weight * torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
+
+    assert rz(small) >= 0.0
+    assert rz(big) > rz(small)
+
+    # and it actually reaches the MoE aux-loss total
+    config = _tiny_config(router_z_loss_weight=weight)
+    moe = MoELayer(config)
+    moe_off = MoELayer(_tiny_config())
+    moe_off.load_state_dict(moe.state_dict())
+    x = torch.randn(2, 5, config.d_model)
+
+    _, aux_on = moe(x)
+    _, aux_off = moe_off(x)
+    assert aux_on > aux_off  # the only difference is the added z-loss term
+
+
+def test_router_z_loss_applies_with_the_loss_free_balancer_too():
+    """Requirement 4.3 is balancer-independent: loss-free normally reports
+    no aux loss (`None`), but with `router_z_loss_weight > 0` the router
+    z-loss becomes the whole aux-loss term rather than being dropped."""
+    torch.manual_seed(0)
+    config = _tiny_config(moe_balancing="loss_free", router_z_loss_weight=1e-2)
+    moe = MoELayer(config)
+    x = torch.randn(2, 5, config.d_model)
+
+    _, aux_loss = moe(x)
+
+    assert aux_loss is not None
+    assert torch.isfinite(aux_loss) and aux_loss > 0.0
+
+
+def test_aux_loss_weight_is_config_driven():
+    """Requirement 4.5: `AuxLossBalancer.loss_weight` comes from
+    `ModelConfig.aux_loss_weight` (default 0.01, unchanged) rather than a
+    hard-coded literal."""
+    assert MoELayer(_tiny_config()).balancer.loss_weight == pytest.approx(0.01)
+    assert MoELayer(_tiny_config(aux_loss_weight=0.05)).balancer.loss_weight == pytest.approx(0.05)

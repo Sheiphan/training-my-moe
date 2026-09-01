@@ -109,7 +109,7 @@
     links.
   - _Requirements: 3.1, 3.2, 3.3, 3.4_
 
-- [ ] 9. MoE routing: config-driven weights, router z-loss, sigmoid scoring
+- [x] 9. MoE routing: config-driven weights, router z-loss, sigmoid scoring
   - `AuxLossBalancer` reads `aux_loss_weight`; add the optional router
     z-loss term. New `score_and_select(...)` handling
     `router_scoring in {"softmax", "sigmoid"}`; wire through `MoELayer`

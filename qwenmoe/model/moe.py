@@ -84,6 +84,44 @@ class Router(nn.Module):
         return self.gate(x)
 
 
+def score_and_select(
+    router_logits: torch.Tensor,
+    balancer: nn.Module,
+    top_k: int,
+    scoring: str = "softmax",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Turns raw router logits into `(topk_indices, topk_weights,
+    routing_probs)` (moe-modernization Requirement 4.1, 4.2).
+
+    - `scoring == "softmax"` (default): exactly the pre-spec path -- a
+      softmax over experts is *both* the routing distribution and the source
+      of the renormalized top-k combination weights.
+    - `scoring == "sigmoid"` (DeepSeek-V3): score each expert independently
+      with `sigmoid(logit)`, then normalize. Selected affinities (rescaled
+      to sum to 1) become the combination weights; the whole affinity
+      vector (also rescaled to sum to 1) is `routing_probs`, used by the
+      aux loss and the trace.
+
+    In both cases `topk_weights` sums to 1 per token (Requirement 4.6) and
+    `routing_probs` is a per-token distribution over every routed expert, so
+    `AuxLossBalancer.aux_loss` and the Manim trace see the same shape and
+    semantics regardless of `scoring`.
+    """
+    if scoring == "softmax":
+        routing_probs = F.softmax(router_logits, dim=-1)
+    elif scoring == "sigmoid":
+        affinities = torch.sigmoid(router_logits)
+        routing_probs = affinities / affinities.sum(dim=-1, keepdim=True)
+    else:
+        raise ValueError(
+            f"Unknown router_scoring: {scoring!r} (expected 'softmax' or 'sigmoid')"
+        )
+
+    selection_scores = balancer.selection_scores(router_logits, scoring=scoring)
+    topk_indices, topk_weights = select_top_k(selection_scores, routing_probs, top_k)
+    return topk_indices, topk_weights, routing_probs
+
+
 def select_top_k(
     selection_scores: torch.Tensor, router_probs: torch.Tensor, top_k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -121,8 +159,17 @@ class AuxLossBalancer(nn.Module):
         self.n_routed_experts = n_routed_experts
         self.loss_weight = loss_weight
 
-    def selection_scores(self, router_logits: torch.Tensor) -> torch.Tensor:
-        """Unbiased: top-k selection uses the raw router logits directly."""
+    def selection_scores(
+        self, router_logits: torch.Tensor, scoring: str = "softmax"
+    ) -> torch.Tensor:
+        """Unbiased: the raw router logits rank the experts. Both `softmax`
+        and `sigmoid` are monotonic in the logit (softmax shares one
+        denominator per token; sigmoid is elementwise), so the top-k *set*
+        is identical whichever `scoring` is used -- only the combination
+        weights differ, and those come from `routing_probs` in
+        `score_and_select`, not from here. The `scoring` argument is
+        accepted for interface symmetry with `LossFreeBalancer` and ignored.
+        """
         return router_logits
 
     def aux_loss(self, router_probs: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
@@ -169,13 +216,22 @@ class LossFreeBalancer(nn.Module):
         self.update_rate = update_rate
         self.register_buffer("bias", torch.zeros(n_routed_experts))
 
-    def selection_scores(self, router_logits: torch.Tensor) -> torch.Tensor:
-        """Biased: top-k selection uses the softmax score plus this
-        expert's bias (Eq. 3 of Wang et al., 2024) -- recomputing the
-        softmax here (rather than accepting `router_probs` directly) keeps
-        this method's signature identical to `AuxLossBalancer`'s."""
-        router_probs = F.softmax(router_logits, dim=-1)
-        return router_probs + self.bias
+    def selection_scores(
+        self, router_logits: torch.Tensor, scoring: str = "softmax"
+    ) -> torch.Tensor:
+        """Biased: top-k selection uses the routing score plus this expert's
+        bias (Eq. 3 of Wang et al., 2024). With `scoring == "sigmoid"` the
+        base score is the per-expert `sigmoid(logit)` affinity (DeepSeek-V3's
+        actual choice); with `"softmax"` (default) it is the softmax
+        probability, exactly as before this spec. The bias breaks softmax's
+        monotonicity, so unlike `AuxLossBalancer` the base score genuinely
+        matters here. Recomputing it (rather than accepting `router_probs`)
+        keeps this signature identical to `AuxLossBalancer`'s."""
+        if scoring == "sigmoid":
+            base = torch.sigmoid(router_logits)
+        else:
+            base = F.softmax(router_logits, dim=-1)
+        return base + self.bias
 
     def aux_loss(self, router_probs: torch.Tensor, topk_indices: torch.Tensor) -> None:
         """Always `None`: the whole point of this strategy is controlling
@@ -202,7 +258,9 @@ def build_balancer(config: ModelConfig) -> nn.Module:
     """Constructs the MoE load-balancing strategy named by
     `config.moe_balancing` (Requirement 12.3)."""
     if config.moe_balancing == "aux_loss":
-        return AuxLossBalancer(config.n_routed_experts)
+        # loss_weight is config-driven now (moe-modernization Requirement
+        # 4.5); the 0.01 default matches the previously hard-coded value.
+        return AuxLossBalancer(config.n_routed_experts, loss_weight=config.aux_loss_weight)
     if config.moe_balancing == "loss_free":
         return LossFreeBalancer(config.n_routed_experts)
     raise ValueError(f"Unknown moe_balancing: {config.moe_balancing!r}")
@@ -220,6 +278,11 @@ class MoELayer(nn.Module):
         super().__init__()
         self.top_k = config.top_k
         self.n_routed_experts = config.n_routed_experts
+        # moe-modernization Requirement 4: both default to the pre-spec path
+        # ("softmax", 0.0), so a config written before this spec routes
+        # bit-identically to today.
+        self.router_scoring = config.router_scoring
+        self.router_z_loss_weight = config.router_z_loss_weight
 
         self.router = Router(config.d_model, config.n_routed_experts)
         self.routed_experts = nn.ModuleList(
@@ -235,10 +298,9 @@ class MoELayer(nn.Module):
         x_flat = x.reshape(-1, d_model)
 
         router_logits = self.router(x_flat)
-        router_probs = F.softmax(router_logits, dim=-1)
-
-        selection_scores = self.balancer.selection_scores(router_logits)
-        topk_indices, topk_weights = select_top_k(selection_scores, router_probs, self.top_k)
+        topk_indices, topk_weights, routing_probs = score_and_select(
+            router_logits, self.balancer, self.top_k, self.router_scoring
+        )
         # Cached for Trainer's expert-utilization logging (Requirement 8.2, task 10) --
         # not part of forward's return signature, so no existing caller is disturbed.
         self.last_expert_counts = torch.bincount(
@@ -271,8 +333,27 @@ class MoELayer(nn.Module):
             shared_output = shared_output + expert(x_flat)
 
         output = (routed_output + shared_output).view(batch, seq_len, d_model)
-        aux_loss = self.balancer.aux_loss(router_probs, topk_indices)
+        aux_loss = self.balancer.aux_loss(routing_probs, topk_indices)
+        aux_loss = self._add_router_z_loss(aux_loss, router_logits)
         return output, aux_loss
+
+    def _add_router_z_loss(
+        self, aux_loss: torch.Tensor | None, router_logits: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Requirement 4.3: add `router_z_loss_weight * mean(logsumexp(
+        router_logits)^2)` -- the ST-MoE penalty on the router's pre-softmax
+        logits -- into the MoE aux-loss total. Balancer-independent: it also
+        applies with the loss-free balancer, where `aux_loss` is otherwise
+        `None` (then the router z-loss becomes the whole term). Off (weight
+        `0`, the default) returns `aux_loss` untouched, so the pre-spec path
+        is bit-identical.
+        """
+        if self.router_z_loss_weight <= 0:
+            return aux_loss
+        z_loss = self.router_z_loss_weight * torch.logsumexp(
+            router_logits.float(), dim=-1
+        ).pow(2).mean()
+        return z_loss if aux_loss is None else aux_loss + z_loss
 
     def forward_with_trace(
         self, x: torch.Tensor
@@ -285,10 +366,9 @@ class MoELayer(nn.Module):
         x_flat = x.reshape(-1, d_model)
 
         router_logits = self.router(x_flat)
-        router_probs = F.softmax(router_logits, dim=-1)
-
-        selection_scores = self.balancer.selection_scores(router_logits)
-        topk_indices, topk_weights = select_top_k(selection_scores, router_probs, self.top_k)
+        topk_indices, topk_weights, routing_probs = score_and_select(
+            router_logits, self.balancer, self.top_k, self.router_scoring
+        )
         self.last_expert_counts = torch.bincount(
             topk_indices.detach().flatten(), minlength=self.n_routed_experts
         )
@@ -309,11 +389,12 @@ class MoELayer(nn.Module):
             shared_output = shared_output + expert(x_flat)
 
         output = (routed_output + shared_output).view(batch, seq_len, d_model)
-        aux_loss = self.balancer.aux_loss(router_probs, topk_indices)
+        aux_loss = self.balancer.aux_loss(routing_probs, topk_indices)
+        aux_loss = self._add_router_z_loss(aux_loss, router_logits)
 
         trace = {
             "router_logits": router_logits,
-            "router_probs": router_probs,
+            "router_probs": routing_probs,
             "topk_indices": topk_indices,
             "topk_weights": topk_weights,
             "expert_outputs": expert_outputs,
