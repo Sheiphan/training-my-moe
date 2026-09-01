@@ -1,5 +1,14 @@
 """Scaled dot-product self-attention with Grouped-Query Attention (GQA)
 and a swappable positional scheme (Requirements 1.5, 1.6, 12.1).
+
+`forward` (the path every real training/inference call uses) runs fused
+`F.scaled_dot_product_attention` (moe-modernization Requirement 7.1-7.2,
+task 5); `forward_with_trace` (only ever called by
+`viz/scenes_*.py`/`TransformerBlock.forward_with_trace`) keeps the
+original explicit matmul/mask/softmax/matmul steps so every intermediate
+tensor stays inspectable for the Manim scenes -- the two are numerically
+equivalent within `1e-5`, not bit-identical, since a fused kernel is free
+to sum in a different order (`tests/test_trace.py`).
 """
 from __future__ import annotations
 
@@ -49,6 +58,22 @@ class Attention(nn.Module):
         self.positional = build_positional_scheme(config, self.head_dim)
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """moe-modernization Requirement 7.1-7.2: the non-trace path calls
+        fused `F.scaled_dot_product_attention` instead of materializing an
+        explicit `(seq_len, seq_len)` score matrix -- the same causal-GQA
+        math as `forward_with_trace` below, just computed by one fused
+        kernel instead of separate matmul/mask/softmax/matmul steps.
+        `enable_gqa=True` lets SDPA itself broadcast each of the
+        `n_kv_heads` key/value heads across its `n_rep` query heads,
+        replacing the explicit `repeat_interleave` this method used to do.
+        ALiBi's additive bias can't be combined with `is_causal=True`
+        (SDPA rejects an explicit `attn_mask` together with `is_causal`),
+        so when a positional scheme supplies one, it's pre-summed with an
+        explicit causal `-inf` mask into a single `attn_mask` instead --
+        addition is commutative, so this is the exact same total added to
+        the scores as the old bias-then-causal-mask sequence, just fused
+        into one SDPA call rather than two `scores +=` steps.
+        """
         batch, seq_len, _ = x.shape
 
         q = self.w_q(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -57,23 +82,15 @@ class Attention(nn.Module):
 
         q, k = self.positional.apply_to_qk(q, k, positions)
 
-        if self.n_rep > 1:
-            k = k.repeat_interleave(self.n_rep, dim=1)
-            v = v.repeat_interleave(self.n_rep, dim=1)
-
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
         bias = self.positional.attention_bias(seq_len)
-        if bias is not None:
-            scores = scores + bias.to(scores.dtype)
-
-        causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=x.device), diagonal=1
-        )
-        scores = scores + causal_mask
-
-        probs = F.softmax(scores, dim=-1)
-        out = probs @ v  # (batch, n_heads, seq_len, head_dim)
+        if bias is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        else:
+            causal_mask = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=x.device), diagonal=1
+            )
+            attn_mask = (bias.to(q.dtype) + causal_mask).unsqueeze(0)  # broadcasts over batch/heads
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=True)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.n_heads * self.head_dim)
         return self.w_o(out)
@@ -213,15 +230,13 @@ class MLAAttention(nn.Module):
         q = torch.cat([q_content, q_rope], dim=-1)
         k = torch.cat([k_content, k_rope], dim=-1)
 
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim + self.rope_head_dim)
-
-        causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=x.device), diagonal=1
-        )
-        scores = scores + causal_mask
-
-        probs = F.softmax(scores, dim=-1)
-        out = probs @ v  # (batch, n_heads, seq_len, head_dim) -- content V only, no rope part
+        # moe-modernization Requirement 7.1: fused SDPA replaces the explicit
+        # matmul/mask/softmax/matmul below. No ALiBi branch here -- MLA
+        # always uses its own decoupled RoPE (see the class docstring), so
+        # there's never a bias to fold into an explicit attn_mask; SDPA's
+        # default scale (1/sqrt(q's last dim)) already equals
+        # 1/sqrt(head_dim + rope_head_dim) since q is exactly that wide.
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.n_heads * self.head_dim)
         return self.w_o(out)

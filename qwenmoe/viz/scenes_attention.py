@@ -213,7 +213,9 @@ class AttentionScene(Scene):
         self.play(Create(w_bars), Write(w_caption))
         self.wait(1.5)
 
-        manual_out = probs @ v  # exactly what Attention.forward computes per head, real tensors
+        manual_out = probs @ v  # the same per-head weighted sum forward_with_trace's explicit
+        # math performs (Attention.forward itself has used a fused SDPA kernel since
+        # moe-modernization task 5, numerically equivalent within 1e-5, not this exact op)
         shown = manual_out[:8].tolist()
         out_bars = self._manual_bars(
             shown, [f"d{i}" for i in range(8)], [ORANGE] * 8, [f"{v:.3f}" for v in shown],

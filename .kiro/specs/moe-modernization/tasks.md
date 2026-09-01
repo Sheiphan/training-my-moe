@@ -66,7 +66,7 @@
     derived, a 2×2 worked example, links to the Muon reports.
   - _Requirements: 1.4, 1.5, 1.6_
 
-- [ ] 5. Attention: fused SDPA on the non-trace path
+- [x] 5. Attention: fused SDPA on the non-trace path
   - `Attention.forward` and `MLAAttention.forward` call
     `F.scaled_dot_product_attention(is_causal=True, enable_gqa=True)`;
     drop the explicit `-inf` mask and `repeat_interleave`. ALiBi passes its

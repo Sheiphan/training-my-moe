@@ -99,19 +99,30 @@ def test_forward_with_trace_populates_every_field_with_expected_shape(positional
             assert torch.isfinite(expert_output).all()
 
 
-def test_forward_with_trace_matches_forward_exactly():
-    """Requirement 7.1: `forward_with_trace` must be the same computation
-    as `forward`, not a separate visualization math path -- their logits
-    should be bit-for-bit identical given the same weights and input."""
-    model, tokenizer = _tiny_setup()
+@pytest.mark.parametrize("positional_scheme", ["rope", "nope", "alibi"])
+def test_forward_with_trace_matches_forward_within_tolerance(positional_scheme):
+    """Requirement 7.1-7.2: `forward_with_trace` must be the *same
+    computation* as `forward` -- same weights, same math -- but since
+    moe-modernization task 5, `forward` runs it through fused
+    `F.scaled_dot_product_attention` while `forward_with_trace` keeps the
+    explicit matmul/mask/softmax/matmul steps for teachability (design.md:
+    "forward_with_trace keeps the explicit math plus nothing else
+    changes"). A fused kernel is free to sum in a different order (and, on
+    some backends, run a different algorithm such as flash attention)
+    than the manual softmax, so the two paths are no longer required to be
+    *bit-for-bit* identical -- only numerically identical within a tight
+    tolerance, for every positional scheme (rope/nope/alibi exercise the
+    three different `attention_bias`-vs-`None` branches `Attention.
+    forward` now takes)."""
+    model, tokenizer = _tiny_setup(positional_scheme=positional_scheme)
     input_ids = _encode(tokenizer, "hello")
 
     with torch.no_grad():
         logits_plain, _ = model(input_ids)
         logits_traced, bundle = model.forward_with_trace(input_ids)
 
-    assert torch.equal(logits_plain, logits_traced)
-    assert torch.equal(bundle.logits, logits_plain.squeeze(0))
+    assert torch.allclose(logits_plain, logits_traced, atol=1e-5)
+    assert torch.allclose(bundle.logits, logits_plain.squeeze(0), atol=1e-5)
 
 
 def test_forward_with_trace_rejects_batch_size_greater_than_one():
@@ -153,9 +164,10 @@ def test_forward_with_trace_populates_every_field_for_mla():
         )
 
 
-def test_forward_with_trace_matches_forward_exactly_for_mla():
-    """Same bit-for-bit-identical guarantee as the GQA test above, for the
-    MLA attention variant."""
+def test_forward_with_trace_matches_forward_within_tolerance_for_mla():
+    """Same tolerance-based guarantee as the GQA test above (moe-
+    modernization task 5 -- see its docstring), for the MLA attention
+    variant."""
     model, tokenizer = _tiny_setup(attention_variant="mla", mla_latent_dim=8, n_kv_heads=2)
     input_ids = _encode(tokenizer, "hello")
 
@@ -163,8 +175,8 @@ def test_forward_with_trace_matches_forward_exactly_for_mla():
         logits_plain, _ = model(input_ids)
         logits_traced, bundle = model.forward_with_trace(input_ids)
 
-    assert torch.equal(logits_plain, logits_traced)
-    assert torch.equal(bundle.logits, logits_plain.squeeze(0))
+    assert torch.allclose(logits_plain, logits_traced, atol=1e-5)
+    assert torch.allclose(bundle.logits, logits_plain.squeeze(0), atol=1e-5)
 
 
 def test_expert_outputs_only_populated_for_dispatched_experts():
