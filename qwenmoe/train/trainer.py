@@ -1,8 +1,10 @@
-"""Training loop (Requirement 5): AdamW with a warmup+cosine learning-rate
-schedule, device auto-selection (`mps` else `cpu`), periodic console +
-JSON-lines logging of per-step metrics and per-expert token counts (consumed
-later by the training-observability scenes, task 14), periodic validation
-loss/perplexity, and checkpoint save/resume.
+"""Training loop (Requirement 5): AdamW (or Muon, moe-modernization spec
+task 4) with a warmup + cosine-or-WSD learning-rate schedule, gradient
+clipping, device auto-selection (`mps` else `cpu`), periodic console +
+JSON-lines logging of per-step metrics (now including gradient norm) and
+per-expert token counts (consumed later by the training-observability
+scenes, task 14), periodic validation loss/perplexity, and checkpoint
+save/resume.
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from qwenmoe.config import ModelConfig, TrainConfig
 from qwenmoe.model.transformer import QwenMoEModel
+from qwenmoe.train.optim import build_optimizer
 
 logger = logging.getLogger(__name__)
 
@@ -57,24 +60,67 @@ def select_device(requested: Literal["auto", "mps", "cpu"]) -> str:
     return "cpu"
 
 
-def lr_multiplier(step: int, warmup_steps: int, total_steps: int) -> float:
+def lr_multiplier(
+    step: int,
+    warmup_steps: int,
+    total_steps: int,
+    schedule: Literal["cosine", "wsd"] = "cosine",
+    min_lr_ratio: float = 0.0,
+    decay_fraction: float = 0.2,
+) -> float:
     """Linear warmup from `1/warmup_steps` to `1.0` over `warmup_steps`,
-    then cosine decay from `1.0` towards `0.0` by `total_steps`
-    (Requirement 5.1). `step` is 0-indexed (the step about to run); a
-    `warmup_steps` of 0 skips straight to the cosine phase.
+    then one of two post-warmup decay curves (Requirement 5.1;
+    moe-modernization Requirement 2), both landing on `min_lr_ratio`
+    (default `0.0`, today's exact behavior) rather than `0.0` when set
+    above zero. `step` is 0-indexed (the step about to run); a
+    `warmup_steps` of 0 skips straight to the decay phase.
+
+    - `schedule="cosine"` (default): smooth cosine decay across the *entire*
+      post-warmup span, `1.0` at `step == warmup_steps` down to
+      `min_lr_ratio` at `step == total_steps`.
+    - `schedule="wsd"` (Hu et al. 2024 / MiniCPM's Warmup-Stable-Decay):
+      holds the multiplier flat at `1.0` for a "stable" plateau, then
+      decays *linearly* to `min_lr_ratio` only over the final
+      `decay_fraction` of `total_steps` -- so a checkpoint saved anywhere
+      in the plateau is a valid launch point for a fresh, shorter decay
+      ("cooldown branch"), which a schedule that decays from the very
+      first post-warmup step can't offer.
     """
     if warmup_steps > 0 and step < warmup_steps:
         return (step + 1) / warmup_steps
     if total_steps <= warmup_steps:
         return 1.0
+
+    if schedule == "wsd":
+        decay_steps = max(1, round(decay_fraction * total_steps))
+        decay_start = max(warmup_steps, total_steps - decay_steps)
+        if step < decay_start:
+            return 1.0  # stable phase: held at peak
+        progress = min((step - decay_start) / (total_steps - decay_start), 1.0)
+        return 1.0 - (1.0 - min_lr_ratio) * progress  # linear decay to the floor
+
+    if schedule != "cosine":
+        raise ValueError(f"Unknown lr_schedule: {schedule!r}")
     progress = min((step - warmup_steps) / (total_steps - warmup_steps), 1.0)
-    return 0.5 * (1.0 + math.cos(math.pi * progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
 
 def _set_lr(
-    optimizer: torch.optim.Optimizer, base_lr: float, step: int, warmup_steps: int, total_steps: int
+    optimizer: torch.optim.Optimizer,
+    base_lr: float,
+    step: int,
+    total_steps: int,
+    config: TrainConfig,
 ) -> float:
-    lr = base_lr * lr_multiplier(step, warmup_steps, total_steps)
+    lr = base_lr * lr_multiplier(
+        step,
+        config.warmup_steps,
+        total_steps,
+        schedule=config.lr_schedule,
+        min_lr_ratio=config.min_lr_ratio,
+        decay_fraction=config.decay_fraction,
+    )
     for group in optimizer.param_groups:
         group["lr"] = lr
     return lr
@@ -106,8 +152,12 @@ def _collect_expert_counts(model: QwenMoEModel) -> list[list[int]]:
 
 
 def _forward_backward_step(
-    model: QwenMoEModel, optimizer: torch.optim.Optimizer, x: torch.Tensor, y: torch.Tensor
-) -> tuple[float, float | None]:
+    model: QwenMoEModel,
+    optimizer: torch.optim.Optimizer,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    grad_clip_norm: float,
+) -> tuple[float, float | None, float]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
     logits, extras = model(x)
@@ -115,8 +165,12 @@ def _forward_backward_step(
     aux_loss = extras.get("aux_loss")
     total_loss = loss if aux_loss is None else loss + aux_loss
     total_loss.backward()
+    # Returns the *pre-clip* global norm (Requirement 1.3) -- clip_grad_norm_
+    # computes it before rescaling, so this doubles as a training-health
+    # signal: a rising norm here typically precedes a loss spike.
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
     optimizer.step()
-    return loss.item(), (aux_loss.item() if aux_loss is not None else None)
+    return loss.item(), (aux_loss.item() if aux_loss is not None else None), float(grad_norm)
 
 
 def _run_step(
@@ -125,20 +179,21 @@ def _run_step(
     x: torch.Tensor,
     y: torch.Tensor,
     device: str,
-    base_lr: float,
     step: int,
     total_steps: int,
-    warmup_steps: int,
-) -> tuple[float, float | None, float, str, QwenMoEModel]:
+    config: TrainConfig,
+) -> tuple[float, float | None, float, float, str, QwenMoEModel]:
     """Runs one training step, falling back to `cpu` if a real `RuntimeError`
     hits mid-step on `mps` (design.md Error Handling: "MPS unavailable/errors
     during a step -> fall back to cpu with a logged warning, never a hard
     crash", Requirement 3.2). Returns the (possibly updated) `device`/`model`
     so the caller keeps using them for subsequent steps.
     """
-    current_lr = _set_lr(optimizer, base_lr, step, warmup_steps, total_steps)
+    current_lr = _set_lr(optimizer, config.lr, step, total_steps, config)
     try:
-        train_loss, aux_loss_value = _forward_backward_step(model, optimizer, x.to(device), y.to(device))
+        train_loss, aux_loss_value, grad_norm = _forward_backward_step(
+            model, optimizer, x.to(device), y.to(device), config.grad_clip_norm
+        )
     except RuntimeError as exc:
         if device != "mps":
             raise
@@ -150,8 +205,10 @@ def _run_step(
         model = model.to("cpu")
         _move_optimizer_state_to_device(optimizer, "cpu")
         device = "cpu"
-        train_loss, aux_loss_value = _forward_backward_step(model, optimizer, x.to(device), y.to(device))
-    return train_loss, aux_loss_value, current_lr, device, model
+        train_loss, aux_loss_value, grad_norm = _forward_backward_step(
+            model, optimizer, x.to(device), y.to(device), config.grad_clip_norm
+        )
+    return train_loss, aux_loss_value, grad_norm, current_lr, device, model
 
 
 def _evaluate(
@@ -253,7 +310,7 @@ class Trainer:
         torch.manual_seed(config.seed)
 
         model = model.to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+        optimizer = build_optimizer(model, config)
 
         global_step = 0
         if resume_from is not None:
@@ -286,16 +343,15 @@ class Trainer:
                 x, y = next(train_iter)
 
                 step_start = time.perf_counter()
-                train_loss, aux_loss_value, current_lr, device, model = _run_step(
+                train_loss, aux_loss_value, grad_norm, current_lr, device, model = _run_step(
                     model,
                     optimizer,
                     x,
                     y,
                     device,
-                    config.lr,
                     global_step,
                     total_steps,
-                    config.warmup_steps,
+                    config,
                 )
                 elapsed = time.perf_counter() - step_start
 
@@ -321,6 +377,7 @@ class Trainer:
                             "train_loss": train_loss,
                             "aux_loss": aux_loss_value,
                             "lr": current_lr,
+                            "grad_norm": grad_norm,
                             "elapsed_s": elapsed,
                             "expert_token_counts": _collect_expert_counts(model),
                         },

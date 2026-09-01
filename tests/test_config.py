@@ -57,6 +57,82 @@ def test_train_config_valid_defaults():
     assert cfg.seed == 1337
 
 
+# -- moe-modernization spec: new config axes -------------------------------
+
+
+def test_model_config_modernization_defaults_are_pre_spec_behavior():
+    """Every field this spec adds must default to the old behavior so a
+    config written before the spec is unchanged (Requirement 13.1)."""
+    cfg = ModelConfig(vocab_size=100)
+    assert cfg.router_scoring == "softmax"
+    assert cfg.router_z_loss_weight == 0.0
+    assert cfg.aux_loss_weight == pytest.approx(0.01)
+    assert cfg.seq_balance_loss_weight == 0.0
+    assert cfg.qk_norm is False
+    assert cfg.mtp_depth == 0
+    assert cfg.init_std == pytest.approx(0.02)
+
+
+def test_train_config_modernization_defaults():
+    cfg = TrainConfig(batch_size=8, seq_len=128, total_tokens=1000)
+    assert cfg.optimizer == "adamw"
+    assert cfg.betas == (0.9, 0.95)
+    assert cfg.weight_decay == pytest.approx(0.1)
+    assert cfg.grad_clip_norm == pytest.approx(1.0)
+    assert cfg.lr_schedule == "cosine"
+    assert cfg.min_lr_ratio == pytest.approx(0.1)
+    assert cfg.decay_fraction == pytest.approx(0.2)
+    assert cfg.precision == "fp32"
+    assert cfg.z_loss_weight == 0.0
+    assert cfg.document_masking is False
+
+
+def test_data_config_val_split_mode_default():
+    cfg = DataConfig(corpus="tiny_shakespeare", tokenizer_type="char")
+    assert cfg.val_split_mode == "tail"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"router_z_loss_weight": -0.1},
+        {"aux_loss_weight": -1.0},
+        {"seq_balance_loss_weight": -0.001},
+        {"mtp_depth": -1},
+        {"mtp_lambda": -0.5},
+        {"init_std": 0.0},
+        {"init_std": -0.02},
+    ],
+)
+def test_model_config_modernization_invalid_raise(overrides):
+    with pytest.raises(ValueError):
+        ModelConfig(vocab_size=100, **overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"betas": (0.0, 0.95)},
+        {"betas": (0.9, 1.0)},
+        {"adam_eps": 0.0},
+        {"weight_decay": -0.1},
+        {"grad_clip_norm": 0.0},
+        {"muon_lr": 0.0},
+        {"muon_momentum": 1.0},
+        {"muon_momentum": -0.1},
+        {"min_lr_ratio": 1.5},
+        {"min_lr_ratio": -0.1},
+        {"decay_fraction": 0.0},
+        {"decay_fraction": 1.5},
+        {"z_loss_weight": -1e-5},
+    ],
+)
+def test_train_config_modernization_invalid_raise(overrides):
+    kwargs = {"batch_size": 8, "seq_len": 128, "total_tokens": 1000, **overrides}
+    with pytest.raises(ValueError):
+        TrainConfig(**kwargs)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

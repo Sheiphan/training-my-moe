@@ -32,6 +32,24 @@ class ModelConfig:
     tie_word_embeddings: bool = True
     rope_theta: float = 10000.0
 
+    # -- moe-modernization spec: routing (Requirement 4) --
+    # Every field below defaults to the pre-spec behavior, so a config
+    # written before this spec is bit-comparable to today.
+    router_scoring: Literal["softmax", "sigmoid"] = "softmax"
+    router_z_loss_weight: float = 0.0      # ST-MoE router logit penalty; 0 == off
+    aux_loss_weight: float = 0.01          # was hard-coded in AuxLossBalancer
+    seq_balance_loss_weight: float = 0.0   # DeepSeek-V3 loss-free complementary loss; 0 == off
+
+    # -- attention (Requirement 7) --
+    qk_norm: bool = False                  # per-head RMSNorm on q/k before RoPE
+
+    # -- multi-token prediction (Requirement 6) --
+    mtp_depth: int = 0                     # extra prediction heads; 0 == off
+    mtp_lambda: float = 0.3               # weight on the averaged MTP loss
+
+    # -- initialization (Requirement 9) --
+    init_std: float = 0.02                # truncated-normal std for linears/embedding
+
     def __post_init__(self) -> None:
         if self.vocab_size < 1:
             raise ValueError(f"vocab_size must be >= 1, got {self.vocab_size}")
@@ -64,6 +82,22 @@ class ModelConfig:
             raise ValueError(f"lora_rank must be >= 1, got {self.lora_rank}")
         if self.max_seq_len < 1:
             raise ValueError(f"max_seq_len must be >= 1, got {self.max_seq_len}")
+        if self.router_z_loss_weight < 0:
+            raise ValueError(
+                f"router_z_loss_weight must be >= 0, got {self.router_z_loss_weight}"
+            )
+        if self.aux_loss_weight < 0:
+            raise ValueError(f"aux_loss_weight must be >= 0, got {self.aux_loss_weight}")
+        if self.seq_balance_loss_weight < 0:
+            raise ValueError(
+                f"seq_balance_loss_weight must be >= 0, got {self.seq_balance_loss_weight}"
+            )
+        if self.mtp_depth < 0:
+            raise ValueError(f"mtp_depth must be >= 0, got {self.mtp_depth}")
+        if self.mtp_lambda < 0:
+            raise ValueError(f"mtp_lambda must be >= 0, got {self.mtp_lambda}")
+        if self.init_std <= 0:
+            raise ValueError(f"init_std must be > 0, got {self.init_std}")
 
 
 @dataclass
@@ -79,6 +113,30 @@ class TrainConfig:
     log_interval_steps: int = 10       # console/JSON-lines logging cadence (Requirement 5.2)
     device: Literal["auto", "mps", "cpu"] = "auto"
     seed: int = 1337
+
+    # -- moe-modernization spec --
+    # Optimizer (Requirement 1). betas/weight_decay defaults are a
+    # deliberate pure-win change from PyTorch's (0.9, 0.999) / 0.01.
+    optimizer: Literal["adamw", "muon"] = "adamw"
+    betas: tuple[float, float] = (0.9, 0.95)
+    adam_eps: float = 1e-8
+    weight_decay: float = 0.1
+    grad_clip_norm: float = 1.0
+    muon_lr: float | None = None        # falls back to `lr` when None
+    muon_momentum: float = 0.95
+
+    # LR schedule (Requirement 2). min_lr_ratio 0.1 is a pure-win change
+    # from the previous decay-to-exactly-zero cosine.
+    lr_schedule: Literal["cosine", "wsd"] = "cosine"
+    min_lr_ratio: float = 0.1
+    decay_fraction: float = 0.2         # wsd only: fraction of steps spent decaying
+
+    # Mixed precision + stability (Requirement 3)
+    precision: Literal["fp32", "bf16"] = "fp32"
+    z_loss_weight: float = 0.0          # output-logit logsumexp penalty; 0 == off
+
+    # Data (Requirement 10)
+    document_masking: bool = False
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
@@ -101,6 +159,24 @@ class TrainConfig:
             raise ValueError(f"max_eval_batches must be >= 1, got {self.max_eval_batches}")
         if self.log_interval_steps < 1:
             raise ValueError(f"log_interval_steps must be >= 1, got {self.log_interval_steps}")
+        if not (0.0 < self.betas[0] < 1.0) or not (0.0 < self.betas[1] < 1.0):
+            raise ValueError(f"betas must both be in (0, 1), got {self.betas}")
+        if self.adam_eps <= 0:
+            raise ValueError(f"adam_eps must be > 0, got {self.adam_eps}")
+        if self.weight_decay < 0:
+            raise ValueError(f"weight_decay must be >= 0, got {self.weight_decay}")
+        if self.grad_clip_norm <= 0:
+            raise ValueError(f"grad_clip_norm must be > 0, got {self.grad_clip_norm}")
+        if self.muon_lr is not None and self.muon_lr <= 0:
+            raise ValueError(f"muon_lr must be > 0 if set, got {self.muon_lr}")
+        if not (0.0 <= self.muon_momentum < 1.0):
+            raise ValueError(f"muon_momentum must be in [0, 1), got {self.muon_momentum}")
+        if not (0.0 <= self.min_lr_ratio <= 1.0):
+            raise ValueError(f"min_lr_ratio must be in [0, 1], got {self.min_lr_ratio}")
+        if not (0.0 < self.decay_fraction <= 1.0):
+            raise ValueError(f"decay_fraction must be in (0, 1], got {self.decay_fraction}")
+        if self.z_loss_weight < 0:
+            raise ValueError(f"z_loss_weight must be >= 0, got {self.z_loss_weight}")
 
 
 @dataclass
@@ -111,6 +187,9 @@ class DataConfig:
     cache_dir: Path = Path(".cache/data")
     fixed_slice_tokens: int | None = None   # ablation mode: same slice for every variant
     fixed_slice_seed: int = 0
+    # moe-modernization spec (Requirement 10.4): "tail" == last val_fraction of
+    # the token stream (today's behavior); "documents" == hold out whole docs.
+    val_split_mode: Literal["tail", "documents"] = "tail"
 
     def __post_init__(self) -> None:
         if self.bpe_vocab_size < 1:
