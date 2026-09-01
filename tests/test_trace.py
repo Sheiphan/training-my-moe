@@ -125,6 +125,21 @@ def test_forward_with_trace_matches_forward_within_tolerance(positional_scheme):
     assert torch.allclose(bundle.logits, logits_plain.squeeze(0), atol=1e-5)
 
 
+def test_forward_with_trace_matches_forward_within_tolerance_with_qk_norm():
+    """Requirement 7.3: qk_norm=True must be applied identically on both
+    paths -- same tolerance-based agreement as the qk_norm=False case
+    above, now with the extra RMSNorm-on-q/k step active on both."""
+    model, tokenizer = _tiny_setup(qk_norm=True)
+    input_ids = _encode(tokenizer, "hello")
+
+    with torch.no_grad():
+        logits_plain, _ = model(input_ids)
+        logits_traced, bundle = model.forward_with_trace(input_ids)
+
+    assert torch.allclose(logits_plain, logits_traced, atol=1e-5)
+    assert torch.allclose(bundle.logits, logits_plain.squeeze(0), atol=1e-5)
+
+
 def test_forward_with_trace_rejects_batch_size_greater_than_one():
     """TraceBundle's shapes have no batch dimension by design -- tracing
     only ever covers a single prompt."""

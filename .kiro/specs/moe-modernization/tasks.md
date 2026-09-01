@@ -77,7 +77,7 @@
   - Journal: what SDPA fuses, why the explicit path stays for teaching.
   - _Requirements: 7.1, 7.2, 7.4, 7.5, 13.3_
 
-- [ ] 6. Attention: QK-norm
+- [x] 6. Attention: QK-norm
   - `Attention` gains `q_norm`/`k_norm` (`RMSNorm(head_dim)`) applied per
     head before the positional transform, in both `forward` and
     `forward_with_trace`, gated on `ModelConfig.qk_norm`.

@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from qwenmoe.config import ModelConfig
 from qwenmoe.model.positional import AlibiBias, NoPositional, RotaryEmbedding
+from qwenmoe.model.rmsnorm import RMSNorm
 
 
 def build_positional_scheme(config: ModelConfig, head_dim: int) -> nn.Module:
@@ -57,6 +58,17 @@ class Attention(nn.Module):
 
         self.positional = build_positional_scheme(config, self.head_dim)
 
+        # QK-norm (moe-modernization Requirement 7.3, default off): a
+        # learnable per-head RMSNorm applied to q and k, independently,
+        # *before* the positional transform -- only constructed when
+        # requested, so a `qk_norm=False` model (Requirement 7.5's
+        # invariant) carries no extra parameters at all, not just unused
+        # ones.
+        self.qk_norm = config.qk_norm
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """moe-modernization Requirement 7.1-7.2: the non-trace path calls
         fused `F.scaled_dot_product_attention` instead of materializing an
@@ -80,6 +92,10 @@ class Attention(nn.Module):
         k = self.w_k(x).view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.w_v(x).view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
         q, k = self.positional.apply_to_qk(q, k, positions)
 
         bias = self.positional.attention_bias(seq_len)
@@ -102,13 +118,21 @@ class Attention(nn.Module):
         intermediate tensor `LayerTrace` needs (Requirement 7.1) -- not a
         separate visualization math path, just extra capture points
         spliced into the same steps `forward` already performs. Only
-        `TransformerBlock.forward_with_trace` calls this.
+        `TransformerBlock.forward_with_trace` calls this. `trace_q`/
+        `trace_k` are captured *after* QK-norm (Requirement 7.3) when it's
+        active, so the trace always reflects the actual q/k that reach the
+        positional transform and the dot product -- not a pre-norm value
+        the rest of the computation never uses.
         """
         batch, seq_len, _ = x.shape
 
         q = self.w_q(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.w_k(x).view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.w_v(x).view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         trace_q, trace_k, trace_v = q.squeeze(0), k.squeeze(0), v.squeeze(0)
 
         q, k = self.positional.apply_to_qk(q, k, positions)
