@@ -1,6 +1,7 @@
-"""Training loop (Requirement 5): AdamW (or Muon, moe-modernization spec
-task 4) with a warmup + cosine-or-WSD learning-rate schedule, gradient
-clipping, device auto-selection (`mps` else `cpu`), periodic console +
+"""Training loop (Requirement 5): AdamW or Muon (`TrainConfig.optimizer`,
+moe-modernization Requirement 1) with a warmup + cosine-or-WSD
+learning-rate schedule, gradient clipping, device auto-selection (`mps`
+else `cpu`), periodic console +
 JSON-lines logging of per-step metrics (now including gradient norm) and
 per-expert token counts (consumed later by the training-observability
 scenes, task 14), periodic validation loss/perplexity, and checkpoint
@@ -113,7 +114,20 @@ def _set_lr(
     total_steps: int,
     config: TrainConfig,
 ) -> float:
-    lr = base_lr * lr_multiplier(
+    """Applies one shared `lr_multiplier` to every param group, but scaled
+    from *that group's own* peak learning rate rather than a single global
+    one -- `build_optimizer` stamps each group with `"base_lr"` at
+    construction (`config.lr` for every AdamW group, `config.muon_lr or
+    config.lr` for the Muon group when `optimizer="muon"`), so a Muon run's
+    two sub-optimizers can ride the same warmup/decay *shape* at two
+    different peak magnitudes (Requirement 1.6 / design.md: "the multiplier
+    from lr_multiplier applies to both"). Groups built before this field
+    existed (there are none left in this codebase, but this keeps the
+    function total) fall back to the passed-in `base_lr`. Returns the
+    applied rate for the *default* (`config.lr`-based) group, which is what
+    the step log records.
+    """
+    multiplier = lr_multiplier(
         step,
         config.warmup_steps,
         total_steps,
@@ -122,8 +136,8 @@ def _set_lr(
         decay_fraction=config.decay_fraction,
     )
     for group in optimizer.param_groups:
-        group["lr"] = lr
-    return lr
+        group["lr"] = group.get("base_lr", base_lr) * multiplier
+    return base_lr * multiplier
 
 
 def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: str) -> None:

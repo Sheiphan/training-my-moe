@@ -7,7 +7,8 @@ import torch
 from qwenmoe.config import ModelConfig, TrainConfig
 from qwenmoe.data.dataset import TokenDataset, train_val_split
 from qwenmoe.model.transformer import QwenMoEModel
-from qwenmoe.train.trainer import Trainer, _evaluate, lr_multiplier, select_device
+from qwenmoe.train.optim import build_optimizer
+from qwenmoe.train.trainer import Trainer, _evaluate, _set_lr, lr_multiplier, select_device
 
 
 def _tiny_model_config(**overrides):
@@ -286,6 +287,123 @@ def test_trainer_logs_grad_norm(tmp_path):
         assert "grad_norm" in record
         assert math.isfinite(record["grad_norm"])
         assert record["grad_norm"] >= 0.0
+
+
+# -- _set_lr applies one multiplier to two different peak rates (Req 1.6) ---
+
+
+def test_set_lr_scales_muon_and_adamw_groups_by_their_own_base_lr():
+    config = _tiny_model_config()
+    model = QwenMoEModel(config)
+    train_config = TrainConfig(
+        batch_size=4,
+        seq_len=8,
+        total_tokens=1000,
+        optimizer="muon",
+        lr=1e-2,
+        muon_lr=4e-2,
+        warmup_steps=0,
+        min_lr_ratio=0.0,
+    )
+    optimizer = build_optimizer(model, train_config)
+
+    # step == warmup_steps == 0: lr_multiplier is past warmup, at the very
+    # start of the decay curve (mult == 1.0), so each group's lr should
+    # equal its own base_lr exactly.
+    _set_lr(optimizer, train_config.lr, step=0, total_steps=100, config=train_config)
+
+    muon_group = next(g for g in optimizer.param_groups if "momentum" in g)
+    adamw_groups = [g for g in optimizer.param_groups if "momentum" not in g]
+    assert muon_group["lr"] == pytest.approx(4e-2)
+    for g in adamw_groups:
+        assert g["lr"] == pytest.approx(1e-2)
+
+
+# -- Muon end to end (moe-modernization Requirement 1.4-1.6) ----------------
+
+
+def test_trainer_runs_and_loss_decreases_with_muon_optimizer(tmp_path):
+    """Mirrors test_trainer_runs_and_loss_decreases but with
+    optimizer='muon' -- Requirement 1.6's "a Muon run ... SHALL train"."""
+    torch.manual_seed(0)
+    config = _tiny_model_config()
+    model = QwenMoEModel(config)
+    train_ds, val_ds = _repeating_datasets()
+    train_config = TrainConfig(
+        batch_size=8,
+        seq_len=16,
+        total_tokens=50 * 8 * 16,
+        optimizer="muon",
+        lr=1e-2,
+        muon_lr=2e-2,
+        warmup_steps=5,
+        checkpoint_interval_steps=50,
+        eval_interval_steps=25,
+        log_interval_steps=1,
+        device="cpu",
+        seed=0,
+    )
+
+    trainer = Trainer(tmp_path)
+    result = trainer.fit(model, train_ds, val_ds, train_config)
+
+    assert result.final_step == 50
+    assert math.isfinite(result.final_train_loss)
+
+    steps = [r for r in _read_jsonl(result.log_path) if r["type"] == "step"]
+    early_mean = sum(r["train_loss"] for r in steps[:5]) / 5
+    late_mean = sum(r["train_loss"] for r in steps[-5:]) / 5
+    assert math.isfinite(early_mean) and math.isfinite(late_mean)
+    assert late_mean < early_mean
+
+
+def test_trainer_checkpoint_round_trips_for_muon_optimizer(tmp_path):
+    """Requirement 1.6: "the checkpoint SHALL round-trip through
+    save/resume for both optimizers" -- a resumed Muon run continues from
+    the saved step with its CombinedOptimizer state (Muon momentum buffers
+    + AdamW moment estimates) restored, not silently reset."""
+    config = _tiny_model_config()
+
+    torch.manual_seed(0)
+    model_a = QwenMoEModel(config)
+    train_ds, val_ds = _repeating_datasets()
+
+    trainer = Trainer(tmp_path)
+    config_a = TrainConfig(
+        batch_size=8,
+        seq_len=16,
+        total_tokens=20 * 8 * 16,
+        optimizer="muon",
+        checkpoint_interval_steps=20,
+        eval_interval_steps=20,
+        log_interval_steps=1,
+        device="cpu",
+    )
+    result_a = trainer.fit(model_a, train_ds, val_ds, config_a)
+    assert result_a.final_step == 20
+    assert result_a.checkpoint_path is not None
+
+    checkpoint = torch.load(result_a.checkpoint_path, map_location="cpu", weights_only=False)
+    assert "sub_optimizers" in checkpoint["optimizer_state_dict"]
+    assert len(checkpoint["optimizer_state_dict"]["sub_optimizers"]) == 2
+
+    torch.manual_seed(999)
+    model_b = QwenMoEModel(config)
+    config_b = TrainConfig(
+        batch_size=8,
+        seq_len=16,
+        total_tokens=30 * 8 * 16,
+        optimizer="muon",
+        checkpoint_interval_steps=10,
+        eval_interval_steps=10,
+        log_interval_steps=1,
+        device="cpu",
+    )
+    result_b = trainer.fit(model_b, train_ds, val_ds, config_b, resume_from=result_a.checkpoint_path)
+
+    assert result_b.final_step == 30
+    steps = [r for r in _read_jsonl(result_b.log_path) if r["type"] == "step"]
+    assert len(steps) == 30  # not 20 + 30 -- resume picked up from step 20, not step 0
 
 
 def test_trainer_resume_continues_from_saved_step(tmp_path):

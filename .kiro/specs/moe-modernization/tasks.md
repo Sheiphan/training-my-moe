@@ -53,7 +53,7 @@
     cooldown-branch idea, with a worked multiplier calculation.
   - _Requirements: 2.1, 2.2, 2.3, 2.4_
 
-- [ ] 4. Muon optimizer
+- [x] 4. Muon optimizer
   - `qwenmoe/train/optim.py`: `zeropower_via_newtonschulz5`, `Muon`
     (`torch.optim.Optimizer`), `CombinedOptimizer` (fan-out
     `step`/`zero_grad`/`state_dict`/`load_state_dict`, concatenated
