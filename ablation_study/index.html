@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QwenMoE — Ablation Study</title>
+<link rel="stylesheet" href="lib/katex.min.css">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header>
+  <h1>Ablation Study — QwenMoE Architecture Comparison</h1>
+  <p class="subtitle">
+    8 real, compute-matched training runs: one <code>SMOKE_TEST</code> baseline plus 7 variants that each
+    change exactly ONE architectural axis, all trained on the identical fixed 200K-character token slice for the
+    identical 600-step budget (Requirements 11.5, 12.6) — so any metric difference below reflects only the axis
+    you select, not different data or compute. Every number is read from a real
+    <code>runs/ablation_study/&lt;variant&gt;/logs/train.jsonl</code> written by <code>Trainer.fit</code>, sourced via
+    <code>scripts/run_ablation_study.py</code> → <code>qwenmoe/train/compare.py::run_comparison</code> — nothing here
+    is illustrative.
+  </p>
+</header>
+
+<div id="controls">
+  <div class="ctrl-group" data-key="preset">
+    <span class="ctrl-label">Preset</span>
+    <button data-value="SMOKE_TEST">SMOKE_TEST</button>
+    <button data-value="BASELINE">BASELINE</button>
+  </div>
+  <div class="ctrl-group" data-key="attention">
+    <span class="ctrl-label">Attention</span>
+    <button data-value="gqa">GQA</button>
+    <button data-value="mla">MLA</button>
+  </div>
+  <div class="ctrl-group" data-key="positional">
+    <span class="ctrl-label">Positional</span>
+    <button data-value="rope">RoPE</button>
+    <button data-value="nope">NoPE</button>
+    <button data-value="alibi">ALiBi</button>
+  </div>
+  <div class="ctrl-group" data-key="activation">
+    <span class="ctrl-label">Activation</span>
+    <button data-value="swiglu">SwiGLU</button>
+    <button data-value="geglu">GEGLU</button>
+    <button data-value="gelu">GELU</button>
+  </div>
+  <div class="ctrl-group" data-key="moe_balancing">
+    <span class="ctrl-label">MoE Balancing</span>
+    <button data-value="aux_loss">Aux-Loss</button>
+    <button data-value="loss_free">Loss-Free</button>
+  </div>
+  <label class="tie-toggle"><input type="checkbox" id="tieChk" checked> Tie word embeddings</label>
+</div>
+<p class="axis-note">Real ablation data changes exactly ONE axis at a time vs the <code>SMOKE_TEST</code> baseline —
+  picking a new axis automatically resets the others to baseline, so every comparison you see stays a genuine
+  single-variable experiment.</p>
+
+<div id="statsLine"></div>
+
+<div id="illustrativeNotice" style="display:none"></div>
+
+<main id="comparison">
+  <section class="panel">
+    <h2>Final metrics <span class="panel-sub">baseline vs selected variant</span></h2>
+    <div id="metricBars" class="chart-box"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Training curves <span class="panel-sub">real per-step/eval log, 600 steps</span></h2>
+    <div id="lossCurve" class="chart-box"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Expert utilization at step 600 <span class="panel-sub">real dispatched-token counts per layer</span></h2>
+    <div id="expertBars" class="chart-box"></div>
+  </section>
+
+  <section class="panel" id="deepdiveSection" style="display:none">
+    <h2 id="deepdiveTitle"></h2>
+    <div id="deepdivePanel" class="deepdive-panel"></div>
+  </section>
+</main>
+
+<footer>
+  Sourced from <code>runs/ablation_study/*/logs/train.jsonl</code> (real <code>Trainer.fit</code> output),
+  <code>configs/presets.py</code>, and <code>qwenmoe/train/compare.py::run_comparison</code> — regenerate with
+  <code>uv run python scripts/run_ablation_study.py</code>. Open this file directly in any browser — no server or
+  build step needed.
+</footer>
+
+<script src="lib/d3.min.js"></script>
+<script src="lib/katex.min.js"></script>
+<script src="data/ablation.js"></script>
+<script src="js/charts.js"></script>
+<script src="js/deep-dive.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

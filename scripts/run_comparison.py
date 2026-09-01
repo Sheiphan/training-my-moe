@@ -1,0 +1,142 @@
+#!/usr/bin/env python
+"""Trains multiple named `ModelConfig` presets on an identical, fixed token
+slice under a shared token budget, and prints/saves a final validation
+loss/perplexity comparison table (Requirement 12.6-12.7).
+
+Usage (compares the baseline positional scheme against two alternatives,
+using tiny-Shakespeare's already-prepared char data):
+    uv run python scripts/prepare_data.py --corpus tiny_shakespeare --tokenizer-type char
+    uv run python scripts/run_comparison.py --presets SMOKE_TEST POS_NOPE POS_ALIBI \\
+        --corpus tiny_shakespeare --tokenizer-type char \\
+        --fixed-slice-tokens 200000 --total-tokens 200000 --output-dir runs/comparison
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import logging
+from pathlib import Path
+
+import configs.presets as presets
+from qwenmoe.config import DataConfig, TrainConfig
+from qwenmoe.train.compare import ComparisonReport, run_comparison
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
+
+
+def _render_table(report: ComparisonReport) -> str:
+    header = f"{'variant':<20}{'train_loss':>12}{'val_loss':>12}{'val_ppl':>12}{'tokens/sec':>14}"
+    lines = [header, "-" * len(header)]
+    for name, result in report.variants.items():
+        lines.append(
+            f"{name:<20}{result.final_train_loss:>12.4f}{result.final_val_loss:>12.4f}"
+            f"{result.val_perplexity:>12.4f}{result.tokens_per_sec:>14.1f}"
+        )
+    return "\n".join(lines)
+
+
+def _report_to_json(report: ComparisonReport) -> dict:
+    return {
+        name: {
+            "final_train_loss": result.final_train_loss,
+            "final_val_loss": result.final_val_loss,
+            "val_perplexity": result.val_perplexity,
+            "tokens_per_sec": result.tokens_per_sec,
+            "log_path": str(result.log_path),
+        }
+        for name, result in report.variants.items()
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--presets",
+        nargs="+",
+        required=True,
+        help="ModelConfig preset names from configs/presets.py to compare, e.g. "
+        "SMOKE_TEST POS_NOPE POS_ALIBI",
+    )
+    parser.add_argument(
+        "--corpus", choices=["tiny_shakespeare", "tiny_stories"], default="tiny_shakespeare"
+    )
+    parser.add_argument("--tokenizer-type", choices=["char", "bpe"], default="char")
+    parser.add_argument("--bpe-vocab-size", type=int, default=4096)
+    parser.add_argument("--cache-dir", type=Path, default=Path(".cache/data"))
+    parser.add_argument(
+        "--fixed-slice-tokens",
+        type=int,
+        required=True,
+        help="identical token slice every variant trains on (Requirement 12.6)",
+    )
+    parser.add_argument("--fixed-slice-seed", type=int, default=0)
+    parser.add_argument(
+        "--total-tokens", type=int, required=True, help="shared training token budget (Requirement 11.5)"
+    )
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--eval-interval-steps", type=int, default=100)
+    parser.add_argument("--max-eval-batches", type=int, default=50)
+    parser.add_argument("--checkpoint-interval-steps", type=int, default=500)
+    parser.add_argument("--log-interval-steps", type=int, default=10)
+    parser.add_argument("--device", choices=["auto", "mps", "cpu"], default="auto")
+    parser.add_argument("--seed", type=int, default=1337)
+    args = parser.parse_args()
+
+    for name in args.presets:
+        if not hasattr(presets, name):
+            raise ValueError(f"no preset named {name!r} in configs/presets.py")
+
+    base_config = getattr(presets, args.presets[0])
+    variants = {name: dataclasses.asdict(getattr(presets, name)) for name in args.presets}
+
+    data_config = DataConfig(
+        corpus=args.corpus,
+        tokenizer_type=args.tokenizer_type,
+        bpe_vocab_size=args.bpe_vocab_size,
+        cache_dir=args.cache_dir,
+        fixed_slice_tokens=args.fixed_slice_tokens,
+        fixed_slice_seed=args.fixed_slice_seed,
+    )
+    train_config = TrainConfig(
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        total_tokens=args.total_tokens,
+        lr=args.lr,
+        warmup_steps=args.warmup_steps,
+        eval_interval_steps=args.eval_interval_steps,
+        max_eval_batches=args.max_eval_batches,
+        checkpoint_interval_steps=args.checkpoint_interval_steps,
+        log_interval_steps=args.log_interval_steps,
+        device=args.device,
+        seed=args.seed,
+    )
+
+    logger.info("comparing presets: %s", ", ".join(args.presets))
+    logger.info(
+        "fixed slice: %d tokens (seed=%d), budget: %d tokens per variant",
+        args.fixed_slice_tokens,
+        args.fixed_slice_seed,
+        args.total_tokens,
+    )
+
+    report = run_comparison(base_config, variants, data_config, train_config, args.output_dir)
+
+    table = _render_table(report)
+    print(table)
+
+    summary_path = Path(args.output_dir) / "comparison_summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(_report_to_json(report), indent=2) + "\n", encoding="utf-8")
+    logger.info("summary written to %s", summary_path)
+
+
+if __name__ == "__main__":
+    main()

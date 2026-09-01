@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Token Journey — QwenMoE Forward Pass Walkthrough</title>
+<link rel="stylesheet" href="lib/katex.min.css">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header>
+  <h1>Token Journey</h1>
+  <p class="subtitle">
+    Follow one real token through one real forward pass of a trained SMOKE_TEST-derived checkpoint,
+    one operation at a time. Toggle Attention/Positional below to see a REAL trained checkpoint for
+    that combination — the diagram and math both change to match. Click <code>&#9654; Play</code> to
+    auto-advance, or step through manually with the rail, arrow keys, or Prev/Next — every number
+    shown is real, captured via <code>qwenmoe/model/trace.py</code>, never illustrative.
+  </p>
+</header>
+
+<div id="controls">
+  <div class="ctrl-group" data-key="attention">
+    <span class="ctrl-label">Attention</span>
+    <button data-value="gqa">GQA</button>
+    <button data-value="mla">MLA</button>
+  </div>
+  <div class="ctrl-group" data-key="positional">
+    <span class="ctrl-label">Positional</span>
+    <button data-value="rope">RoPE</button>
+    <button data-value="nope">NoPE</button>
+    <button data-value="alibi">ALiBi</button>
+  </div>
+</div>
+<p class="axis-note">Both toggles use real trained checkpoints from <code>scripts/run_ablation_study.py</code> —
+  MLA always applies its own decoupled RoPE regardless of Positional, so picking MLA resets Positional
+  to RoPE (and picking any Positional resets Attention back to GQA).</p>
+
+<div class="main-col">
+  <div id="diagram-wrap">
+    <svg id="diagram" viewBox="0 0 1000 700" preserveAspectRatio="xMidYMid meet"></svg>
+  </div>
+
+  <div class="narrative-card" aria-live="polite">
+    <div class="chapter" id="step-chapter"></div>
+    <h2 id="step-title"></h2>
+    <p class="narrative" id="step-narrative"></p>
+    <div class="formula-box" id="step-formula"></div>
+    <div class="real-panel" id="step-real"></div>
+    <button id="deepdive-btn" class="deepdive-btn" type="button" aria-controls="deepdive-panel" aria-expanded="false" style="display:none">&#128269; Zoom into the math</button>
+    <div class="deepdive-panel" id="deepdive-panel" style="display:none"></div>
+  </div>
+</div>
+
+<aside class="rail" aria-label="Walkthrough navigation">
+  <div class="rail-header">
+    <h3>Walkthrough</h3>
+    <div class="rail-controls">
+      <button id="prev-btn" type="button" title="Previous (Left arrow)">&#8592; Prev</button>
+      <button id="play-btn" type="button" title="Play / Pause">&#9654; Play</button>
+      <button id="next-btn" type="button" title="Next (Right arrow / space)">Next &#8594;</button>
+    </div>
+    <div class="progress-label" id="progress-label">Step 1</div>
+    <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+  </div>
+  <div id="rail-steps"></div>
+</aside>
+
+<script src="lib/d3.min.js"></script>
+<script src="lib/katex.min.js"></script>
+<script src="data/trace.js"></script>
+<script src="js/store.js"></script>
+<script src="js/diagram.js"></script>
+<script src="js/camera.js"></script>
+<script src="js/steps.js"></script>
+<script src="js/render-token.js"></script>
+<script src="js/matrix-viz.js"></script>
+<script src="js/deep-dive.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
