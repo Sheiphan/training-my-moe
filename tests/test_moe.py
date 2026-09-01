@@ -1,5 +1,8 @@
+import time
+
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from qwenmoe.config import ModelConfig
@@ -8,6 +11,8 @@ from qwenmoe.model.moe import (
     LossFreeBalancer,
     MoELayer,
     Router,
+    build_expert,
+    dispatch_batched,
     score_and_select,
     select_top_k,
 )
@@ -522,6 +527,146 @@ def test_sequence_balance_loss_only_applies_with_the_loss_free_balancer():
     _, aux_plain = plain(x)
     _, aux_with_weight = with_weight(x)
     assert torch.equal(aux_plain, aux_with_weight)
+
+
+# -- batched expert computation (moe-modernization Requirement 5) -----------
+
+
+def _experts(activation, n_experts, d_model, d_ff, seed=0):
+    torch.manual_seed(seed)
+    cfg = ModelConfig(
+        vocab_size=8, d_model=d_model, d_ff=d_ff, activation=activation,
+        n_routed_experts=n_experts, n_shared_experts=0, top_k=2, max_seq_len=8,
+    )
+    return nn.ModuleList(build_expert(cfg) for _ in range(n_experts))
+
+
+def _reference_routed_output(x_flat, topk_indices, topk_weights, routed_experts):
+    """The exact per-expert loop `MoELayer.forward` used before task 11."""
+    out = torch.zeros_like(x_flat)
+    for e, expert in enumerate(routed_experts):
+        tok, slot = (topk_indices == e).nonzero(as_tuple=True)
+        if tok.numel() == 0:
+            continue
+        gate = topk_weights[tok, slot].unsqueeze(-1)
+        out.index_add_(0, tok, gate * expert(x_flat[tok]))
+    return out
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "geglu", "gelu"])
+def test_dispatch_batched_matches_the_per_expert_loop(activation):
+    """Requirement 5.2: the batched path is a performance refactor -- its
+    output matches the loop within 1e-5, including a batch where some
+    experts get zero tokens (n_experts=6, only ~4 tokens*2 slots dispatched)."""
+    torch.manual_seed(1)
+    d_model, d_ff, n_experts, n_tokens, top_k = 24, 40, 6, 4, 2
+    experts = _experts(activation, n_experts, d_model, d_ff)
+    x = torch.randn(n_tokens, d_model)
+    scores = torch.randn(n_tokens, n_experts)
+    probs = F.softmax(scores, dim=-1)
+    idx, w = select_top_k(scores, probs, top_k)
+
+    batched = dispatch_batched(x, idx, w, experts, activation)
+    reference = _reference_routed_output(x, idx, w, experts)
+
+    assert batched.shape == reference.shape
+    assert torch.allclose(batched, reference, atol=1e-5)
+    # a genuinely idle expert existed in this batch
+    assert (torch.bincount(idx.reshape(-1), minlength=n_experts) == 0).any()
+
+
+def test_dispatch_batched_all_experts_active_matches_loop():
+    torch.manual_seed(2)
+    d_model, d_ff, n_experts, n_tokens, top_k = 32, 64, 4, 40, 2
+    experts = _experts("swiglu", n_experts, d_model, d_ff)
+    x = torch.randn(n_tokens, d_model)
+    probs = F.softmax(torch.randn(n_tokens, n_experts), dim=-1)
+    idx, w = select_top_k(probs, probs, top_k)
+
+    assert torch.allclose(
+        dispatch_batched(x, idx, w, experts, "swiglu"),
+        _reference_routed_output(x, idx, w, experts),
+        atol=1e-5,
+    )
+
+
+def test_dispatch_batched_zero_token_expert_receives_no_gradient():
+    """Requirement 5.3: an expert that got zero tokens is never stacked, so
+    its parameters' `.grad` stays `None` -- exactly like the loop's
+    `continue`."""
+    torch.manual_seed(3)
+    experts = _experts("swiglu", n_experts=4, d_model=16, d_ff=24)
+    x = torch.randn(1, 16)                       # 1 token, top_k=1 -> 3 idle experts
+    idx = torch.tensor([[2]])
+    w = torch.tensor([[1.0]])
+
+    dispatch_batched(x, idx, w, experts, "swiglu").sum().backward()
+
+    got_grad = [all(p.grad is not None for p in e.parameters()) for e in experts]
+    assert got_grad == [False, False, True, False]
+
+
+def test_moe_layer_forward_matches_a_reference_loop_within_tolerance():
+    """Requirement 5.2 at the layer level: swapping in `dispatch_batched`
+    did not change `MoELayer.forward`'s output."""
+    torch.manual_seed(4)
+    config = _tiny_config(n_routed_experts=6, top_k=2)
+    moe = MoELayer(config)
+    moe.eval()  # skip the loss-free bias update path (irrelevant here, aux_loss balancer anyway)
+    x = torch.randn(2, 7, config.d_model)
+
+    out, _ = moe(x)
+
+    # rebuild the routed contribution with the explicit loop, same weights
+    x_flat = x.reshape(-1, config.d_model)
+    router_logits = moe.router(x_flat)
+    idx, w, _ = score_and_select(router_logits, moe.balancer, config.top_k, "softmax")
+    routed_ref = _reference_routed_output(x_flat, idx, w, moe.routed_experts)
+    shared_ref = sum(e(x_flat) for e in moe.shared_experts)
+    ref = (routed_ref + shared_ref).view_as(out)
+
+    assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_parent_spec_state_dict_loads_without_key_migration():
+    """Requirement 5 (testing strategy): keeping `routed_experts` an
+    `nn.ModuleList` means a parent-spec checkpoint's keys
+    (`routed_experts.N.w_gate.weight`) are still exactly the current keys --
+    no migration hook needed."""
+    config = _tiny_config(n_routed_experts=4)
+    reference = MoELayer(config)
+    keys = set(reference.state_dict())
+    assert "routed_experts.0.w_gate.weight" in keys
+    assert "routed_experts.3.w_down.weight" in keys
+
+    fresh = MoELayer(config)
+    missing, unexpected = fresh.load_state_dict(reference.state_dict(), strict=True)
+    assert not missing and not unexpected
+    x = torch.randn(2, 5, config.d_model)
+    assert torch.allclose(fresh(x)[0], reference(x)[0], atol=1e-6)
+
+
+def test_dispatch_batched_wall_clock_scales_sublinearly_with_expert_count():
+    """Requirement 5.5: 4x the experts (param-matched by shrinking d_ff) is
+    nowhere near 4x the wall-clock -- the batched path's cost tracks the
+    token count, not the expert count. Soft timing check with a wide margin."""
+    d_model, n_tokens, top_k = 64, 512, 2
+
+    def time_dispatch(n_experts, d_ff):
+        experts = _experts("swiglu", n_experts, d_model, d_ff)
+        x = torch.randn(n_tokens, d_model)
+        probs = F.softmax(torch.randn(n_tokens, n_experts), dim=-1)
+        idx, w = select_top_k(probs, probs, top_k)
+        for _ in range(3):  # warm up
+            dispatch_batched(x, idx, w, experts, "swiglu")
+        start = time.perf_counter()
+        for _ in range(20):
+            dispatch_batched(x, idx, w, experts, "swiglu")
+        return time.perf_counter() - start
+
+    t8 = time_dispatch(8, 256)
+    t32 = time_dispatch(32, 64)  # 4x experts, 1/4 d_ff -> same routed param count
+    assert t32 < 3.0 * t8  # loop-based code was ~4x here; batched should be ~1x
 
 
 def test_moe_layer_seq_balance_loss_reaches_the_aux_total_and_keeps_bias_gradient_free():

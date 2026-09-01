@@ -133,19 +133,25 @@
     example.
   - _Requirements: 4.4, 4.6_
 
-- [ ] 11. MoE: batched expert computation + checkpoint migration
-  - `RoutedExperts` module holding expert weights as 3-D `nn.Parameter`s;
-    `forward(x_flat, topk_indices, topk_weights)` via argsort +
-    batched/grouped matmul + scatter-add. Shared experts stay a
-    `nn.ModuleList`. `load_state_dict` pre-hook remaps parent-spec keys
-    (`routed_experts.N.w_gate.weight` → new layout).
+- [x] 11. MoE: batched expert computation
+  - IMPLEMENTED via `design.md`'s *alternative* (not `RoutedExperts` 3-D
+    params): `dispatch_batched(x_flat, topk_indices, topk_weights,
+    routed_experts, activation)` — argsort dispatch pairs by expert, pad to
+    a `(K, G, d_model)` capacity grid, 3 batched `bmm`s, mask + scatter-add.
+    Routed experts **stay an `nn.ModuleList` of `nn.Linear`-based experts**,
+    so state-dict keys are unchanged (no migration hook needed), Muon
+    (task 4) is untouched, and `moe.routed_experts[i]` still works for the
+    trace path / `scaling.py` / viz. Only active experts' weights are
+    stacked per forward, so an idle expert's `.grad` stays `None`.
   - `forward_with_trace` keeps the explicit per-expert loop.
   - Tests: batched output matches the loop within `1e-5` incl. a zero-token
-    expert; a parent-spec `MoELayer` state-dict loads via the hook; a
-    32-expert config trains a few steps within a small constant factor of
-    the 8-expert wall-clock.
-  - Journal: why the naïve loop is slow, the sorted-dispatch / grouped-GEMM
-    idea, MegaBlocks link, a small dispatch worked by hand.
+    expert (all 3 activations); an idle expert's params get `grad is None`;
+    `MoELayer.forward` matches a reference loop; a parent-spec state-dict
+    loads with `strict=True` and no migration; wall-clock scales
+    sub-linearly with `n_experts` (measured: batched ~flat 8→64 experts,
+    loop climbs). See journal entry 027 for the rationale of the deviation.
+  - Journal: why the naïve loop is slow, the sorted-dispatch / capacity-grid
+    idea, MegaBlocks/GShard links, a small dispatch worked by hand.
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
 
 - [ ] 12. Multi-Token Prediction head

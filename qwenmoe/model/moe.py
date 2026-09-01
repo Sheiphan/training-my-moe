@@ -307,18 +307,126 @@ def build_balancer(config: ModelConfig) -> nn.Module:
     raise ValueError(f"Unknown moe_balancing: {config.moe_balancing!r}")
 
 
+def _stack_expert_weights(
+    routed_experts: nn.ModuleList, expert_ids: list[int], name: str
+) -> torch.Tensor:
+    """`(len(expert_ids), out_features, in_features)` -- the named
+    `nn.Linear` weight of each listed expert, stacked along a new leading
+    axis. Only the *listed* experts' weights enter the returned tensor's
+    autograd graph, so an expert left out (because it got zero tokens this
+    batch) receives no gradient -- matching the per-expert loop's `continue`
+    (Requirement 5.3)."""
+    return torch.stack([getattr(routed_experts[e], name).weight for e in expert_ids])
+
+
+def dispatch_batched(
+    x_flat: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    routed_experts: nn.ModuleList,
+    activation: str,
+) -> torch.Tensor:
+    """Run every routed expert of one MoE layer as **three batched `bmm`s**
+    instead of a Python loop of `len(routed_experts)` separate expert calls
+    (moe-modernization Requirement 5.1).
+
+    Each token contributes `top_k` `(token, expert)` dispatch pairs. Pairs
+    are grouped by expert (`argsort`), each *active* expert's tokens are
+    laid into row `k` of a padded `(K, G, d_model)` grid (`K` = number of
+    experts that got at least one token, `G` = the largest group), the
+    expert FFN runs batched over `K`, the gate weights are applied, and the
+    results are scatter-added back to `(n_tokens, d_model)`.
+
+    - Padded slots are masked to exactly `0` before the scatter, so the
+      result matches the per-expert loop within `1e-5` (Requirement 5.2).
+    - An expert that got zero tokens is never stacked, never multiplied,
+      and receives no gradient (Requirement 5.3).
+    - Cost is `~O(P · d_model · d_ff)` regardless of `len(routed_experts)`
+      (with balanced routing `K·G ≈ P`), so a 32-expert layer runs in
+      roughly the wall-clock of an 8-expert one rather than 4× it
+      (Requirement 5.5).
+    """
+    n_tokens, d_model = x_flat.shape
+    top_k = topk_indices.shape[1]
+    n_experts = len(routed_experts)
+    device = x_flat.device
+    out = x_flat.new_zeros(n_tokens, d_model)
+
+    pair_expert = topk_indices.reshape(-1)  # (P,)
+    P = pair_expert.numel()
+    if P == 0:
+        return out
+    pair_token = torch.arange(n_tokens, device=device).repeat_interleave(top_k)
+    pair_weight = topk_weights.reshape(-1)
+
+    counts = torch.bincount(pair_expert, minlength=n_experts)  # (E,)
+    active = torch.nonzero(counts, as_tuple=True)[0]  # (K,) ascending expert ids
+    active_counts = counts[active]  # (K,)
+    num_active = active.numel()
+    group_size = int(active_counts.max().item())
+
+    gated = activation in ("swiglu", "geglu")
+    expert_ids = active.tolist()
+    w_first = _stack_expert_weights(routed_experts, expert_ids, "w_gate" if gated else "w_1")
+    w_second = _stack_expert_weights(routed_experts, expert_ids, "w_up") if gated else None
+    w_out = _stack_expert_weights(routed_experts, expert_ids, "w_down" if gated else "w_2")
+
+    order = torch.argsort(pair_expert, stable=True)  # groups pairs by expert
+    sorted_token = pair_token[order]
+    sorted_weight = pair_weight[order]
+    sorted_expert = pair_expert[order]
+
+    # global expert id -> grid row; every dispatched expert is in `active`.
+    expert_to_row = torch.full((n_experts,), -1, device=device, dtype=torch.long)
+    expert_to_row[active] = torch.arange(num_active, device=device)
+    row_of_pair = expert_to_row[sorted_expert]  # (P,) non-decreasing, in [0, K)
+    row_start = active_counts.cumsum(0) - active_counts  # (K,)
+    slot_of_pair = torch.arange(P, device=device) - row_start[row_of_pair]  # (P,) in [0, G)
+
+    grid = torch.full((num_active, group_size), -1, device=device, dtype=torch.long)
+    grid[row_of_pair, slot_of_pair] = torch.arange(P, device=device)
+    valid = grid >= 0  # (K, G)
+    gathered = grid.clamp(min=0)
+
+    token_grid = sorted_token[gathered]  # (K, G)
+    weight_grid = torch.where(valid, sorted_weight[gathered], sorted_weight.new_zeros(()))
+    xg = x_flat[token_grid]  # (K, G, d_model)
+
+    pre = torch.bmm(xg, w_first.transpose(1, 2))  # (K, G, d_ff)
+    if activation == "swiglu":
+        h = F.silu(pre) * torch.bmm(xg, w_second.transpose(1, 2))
+    elif activation == "geglu":
+        h = F.gelu(pre) * torch.bmm(xg, w_second.transpose(1, 2))
+    else:  # plain gelu
+        h = F.gelu(pre)
+    yg = torch.bmm(h, w_out.transpose(1, 2)) * weight_grid.unsqueeze(-1)  # (K, G, d_model)
+    yg = torch.where(valid.unsqueeze(-1), yg, yg.new_zeros(()))
+
+    out.index_add_(0, token_grid.reshape(-1), yg.reshape(-1, d_model).to(out.dtype))
+    return out
+
+
 class MoELayer(nn.Module):
     """Top-k routed experts + always-on shared experts (Requirement
     2.1-2.3): routed-expert outputs are combined with renormalized gate
     weights, shared-expert outputs are added unweighted, and a routed
     expert that receives zero tokens this batch is simply skipped —
     no error, no gradient for it this step (Requirement 2.5).
+
+    The routed experts stay an `nn.ModuleList` of `nn.Linear`-based expert
+    modules (so a parent-spec checkpoint loads with **no** key migration,
+    and `moe.routed_experts[i]` still works for the trace path and the
+    param-counting helpers), but `forward` runs them through
+    `dispatch_batched` -- a few batched `bmm`s -- rather than a Python loop
+    (moe-modernization Requirement 5.1). `forward_with_trace` keeps the
+    explicit per-expert loop (Requirement 5.4).
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.top_k = config.top_k
         self.n_routed_experts = config.n_routed_experts
+        self.activation = config.activation  # which expert FFN dispatch_batched runs
         # moe-modernization Requirement 4: both default to the pre-spec path
         # ("softmax", 0.0), so a config written before this spec routes
         # bit-identically to today.
@@ -356,20 +464,14 @@ class MoELayer(nn.Module):
             # validation-set load stats. No-op for AuxLossBalancer.
             self.balancer.update(self.last_expert_counts)
 
-        routed_output = torch.zeros_like(x_flat)
-        for expert_id, expert in enumerate(self.routed_experts):
-            token_idx, slot_idx = (topk_indices == expert_id).nonzero(as_tuple=True)
-            if token_idx.numel() == 0:
-                continue  # Requirement 2.5: zero tokens this batch, no error, no gradient
-            gate = topk_weights[token_idx, slot_idx].unsqueeze(-1)
-            # `.to(routed_output.dtype)`: under `torch.autocast(bf16)` the
-            # expert's Linear layers emit bf16, but `routed_output` is the
-            # fp32 residual stream and `index_add_` is dtype-strict. Upcasting
-            # the contribution keeps the scatter-accumulate in fp32 (a plain
-            # no-op in the default fp32 path -- byte-identical to before
-            # moe-modernization task 8).
-            contribution = (gate * expert(x_flat[token_idx])).to(routed_output.dtype)
-            routed_output.index_add_(0, token_idx, contribution)
+        # Requirement 5.1: batched dispatch instead of a per-expert Python
+        # loop. `dispatch_batched` handles the zero-token-expert skip
+        # (Requirement 5.3) and the autocast dtype upcast on its final
+        # scatter, so this is a drop-in replacement for the old loop and
+        # matches it within 1e-5 (Requirement 5.2).
+        routed_output = dispatch_batched(
+            x_flat, topk_indices, topk_weights, self.routed_experts, self.activation
+        )
 
         shared_output = torch.zeros_like(x_flat)
         for expert in self.shared_experts:
