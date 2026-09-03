@@ -26,27 +26,27 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
-def _render_table(report: ComparisonReport) -> str:
-    header = f"{'variant':<20}{'train_loss':>12}{'val_loss':>12}{'val_ppl':>12}{'tokens/sec':>14}"
-    lines = [header, "-" * len(header)]
-    for name, result in report.variants.items():
-        lines.append(
-            f"{name:<20}{result.final_train_loss:>12.4f}{result.final_val_loss:>12.4f}"
-            f"{result.val_perplexity:>12.4f}{result.tokens_per_sec:>14.1f}"
-        )
-    return "\n".join(lines)
-
-
 def _report_to_json(report: ComparisonReport) -> dict:
     return {
-        name: {
-            "final_train_loss": result.final_train_loss,
-            "final_val_loss": result.final_val_loss,
-            "val_perplexity": result.val_perplexity,
-            "tokens_per_sec": result.tokens_per_sec,
-            "log_path": str(result.log_path),
-        }
-        for name, result in report.variants.items()
+        "baseline": report.baseline_name,
+        "seeds": list(report.seeds),
+        "variants": {
+            name: {
+                "final_train_loss": result.final_train_loss,
+                "final_val_loss": result.final_val_loss,
+                "val_perplexity": result.val_perplexity,
+                "val_loss_mean": result.val_loss_mean,
+                "val_loss_std": result.val_loss_std,
+                "val_perplexity_mean": result.val_perplexity_mean,
+                "val_perplexity_std": result.val_perplexity_std,
+                "per_seed_val_loss": result.per_seed_val_loss,
+                "within_noise_of_baseline": result.within_noise_of_baseline,
+                "comparison_mode": result.comparison_mode,
+                "tokens_per_sec": result.tokens_per_sec,
+                "log_paths": [str(p) for p in result.log_paths],
+            }
+            for name, result in report.variants.items()
+        },
     }
 
 
@@ -88,6 +88,20 @@ def main() -> None:
     parser.add_argument("--log-interval-steps", type=int, default=10)
     parser.add_argument("--device", choices=["auto", "mps", "cpu"], default="auto")
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="train every variant once per seed and report mean ± std across seeds "
+        "(moe-modernization Requirement 12.1); defaults to just --seed",
+    )
+    parser.add_argument(
+        "--param-matched",
+        action="store_true",
+        help="bisect each variant's d_ff so its total parameter count matches the "
+        "baseline (first preset) within 2% (moe-modernization Requirement 12.4)",
+    )
     args = parser.parse_args()
 
     for name in args.presets:
@@ -119,17 +133,29 @@ def main() -> None:
         seed=args.seed,
     )
 
+    seeds = tuple(args.seeds) if args.seeds else (args.seed,)
     logger.info("comparing presets: %s", ", ".join(args.presets))
     logger.info(
-        "fixed slice: %d tokens (seed=%d), budget: %d tokens per variant",
+        "fixed slice: %d tokens (seed=%d), budget: %d tokens per variant, seeds: %s%s",
         args.fixed_slice_tokens,
         args.fixed_slice_seed,
         args.total_tokens,
+        list(seeds),
+        " [param-matched]" if args.param_matched else "",
     )
 
-    report = run_comparison(base_config, variants, data_config, train_config, args.output_dir)
+    report = run_comparison(
+        base_config,
+        variants,
+        data_config,
+        train_config,
+        args.output_dir,
+        seeds=seeds,
+        param_matched=args.param_matched,
+        baseline_name=args.presets[0],
+    )
 
-    table = _render_table(report)
+    table = report.summary_table()
     print(table)
 
     summary_path = Path(args.output_dir) / "comparison_summary.json"

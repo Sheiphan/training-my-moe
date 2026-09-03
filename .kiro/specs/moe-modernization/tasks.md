@@ -222,14 +222,37 @@
     examples, Llama-3 / Zhao et al. 2024 / Krell et al. 2021.
   - _Requirements: 10.1, 10.2, 10.3, 10.4_
 
-- [ ] 16. Ablation methodology: multi-seed, param-matched, mean ± std
-  - `run_comparison(..., seeds=(1337,))` loops seeds; extended
-    `VariantResult`; summary shows `mean ± std` and a `within_noise` flag.
-  - `param_matched` mode bisects `d_ff` to match baseline total params.
-  - Tests: `len(seeds) > 1` ⇒ `std > 0` and one log per seed; `param_matched`
-    brings a GELU variant's param count within 2% of baseline.
-  - Journal: why single-seed ablations mislead, pooled-std noise bands,
-    compute- vs param-matched comparisons.
+- [x] 16. Ablation methodology: multi-seed, param-matched, mean ± std
+  - `run_comparison(..., *, seeds=None, param_matched=False,
+    baseline_name=None)` — trains each variant once per seed on the same
+    fixed slice (default `(train_config.seed,)` = today's single run),
+    nesting logs under `seed_<n>/` only when >1 seed. `VariantResult`
+    gains `seeds` / `per_seed_val_loss` / `per_seed_val_perplexity` /
+    `val_loss_mean` / `val_loss_std` / `val_perplexity_mean` /
+    `val_perplexity_std` / `log_paths` / `comparison_mode` /
+    `within_noise_of_baseline` (all additive — every pre-task field and
+    single-seed value unchanged). `ComparisonReport` gains `baseline_name`,
+    `seeds`, `summary_table()` (`mean ± std` + `baseline`/`within
+    noise`/`differs`/`n/a (1 seed)` note). `within_noise_of_baseline` =
+    `|Δmean| < hypot(std, std_baseline)`, only when ≥2 seeds.
+    `match_d_ff_to_param_budget(config, target, tol=0.02)` bisects `d_ff`
+    (params monotone in it) to the baseline total within 2%;
+    `param_matched=True` applies it to every non-baseline variant and
+    stamps `comparison_mode`. `scripts/run_comparison.py` gains `--seeds`
+    / `--param-matched`, prints `summary_table()`, JSON records per-seed
+    losses + noise flag + mode.
+  - Tests (+6, 359 → 365): single-seed default keeps scalars + no noise
+    flag + un-nested log path; 3 seeds ⇒ `std > 0` + 3 distinct per-seed
+    losses + one log dir per seed; an identical "twin" variant flags
+    `within noise`; `summary_table()` shows `±` + a note;
+    `match_d_ff_to_param_budget` + `param_matched=True` hit the 2% budget
+    for a GELU variant and stamp the mode.
+  - Journal: `journey_of_a_model/032-multi-seed-and-param-matched-ablations.md`
+    — seeds as samples, the `√(σ² + σ_base²)` noise band derived + worked
+    on measured numbers (NoPE Δ −0.0002 inside a ±0.011 band vs GELU
+    Δ −0.048 at 4× the band), the linear-in-`d_ff` param count + bisection
+    (SwiGLU 128 → GELU 192), compute- vs param-matched (Switch
+    Transformer), Bouthillier et al. 2021 / Dodge et al. 2019.
   - _Requirements: 12.1, 12.2, 12.4_
 
 - [ ] 17. Ablation methodology: refreshed menu, MoE budget note, TinyStories default
