@@ -29,9 +29,11 @@ class TransformerBlock(nn.Module):
         self.moe = MoELayer(config)
 
     def forward(
-        self, x: torch.Tensor, positions: torch.Tensor, kv_cache=None
+        self, x: torch.Tensor, positions: torch.Tensor, kv_cache=None, document_mask=None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        x = x + self.attn(self.attn_norm(x), positions, kv_cache=kv_cache)
+        x = x + self.attn(
+            self.attn_norm(x), positions, kv_cache=kv_cache, document_mask=document_mask
+        )
         moe_out, aux_loss = self.moe(self.moe_norm(x))
         x = x + moe_out
         return x, aux_loss

@@ -681,3 +681,88 @@ def test_trainer_resume_continues_from_saved_step(tmp_path):
     steps = [r for r in _read_jsonl(result_b.log_path) if r["type"] == "step"]
     # If resume had silently restarted from step 0, this would be 50 + 70 = 120.
     assert len(steps) == 70
+
+
+# -- document masking (moe-modernization Requirement 10.2, 10.3) ------------
+
+_DOC_EOS = 9  # last id of the period-10 repeating stream doubles as a separator
+
+
+def _segmented_datasets(seq_len: int = 16, n_repeats: int = 300):
+    """Same period-10 stream as `_repeating_datasets`, but every `9` is
+    treated as a document separator so the windows carry segment ids."""
+    tokens = list(range(10)) * n_repeats
+    train_tokens, val_tokens = train_val_split(tokens, val_fraction=0.1)
+    kw = dict(return_segments=True, eos_id=_DOC_EOS)
+    return TokenDataset(train_tokens, seq_len, **kw), TokenDataset(val_tokens, seq_len, **kw)
+
+
+def _doc_mask_config(**overrides):
+    base = dict(
+        batch_size=8,
+        seq_len=16,
+        total_tokens=40 * 8 * 16,
+        lr=1e-2,
+        warmup_steps=5,
+        checkpoint_interval_steps=40,
+        eval_interval_steps=20,
+        log_interval_steps=1,
+        device="cpu",
+        seed=0,
+    )
+    base.update(overrides)
+    return TrainConfig(**base)
+
+
+def test_trainer_document_masking_run_trains_and_stays_finite(tmp_path):
+    """Requirement 10.2: a `document_masking=True` run consumes
+    `(x, y, segment_ids)` batches, trains (loss decreases) and every step
+    stays finite."""
+    torch.manual_seed(0)
+    model = QwenMoEModel(_tiny_model_config())
+    train_ds, val_ds = _segmented_datasets()
+
+    result = Trainer(tmp_path).fit(
+        model, train_ds, val_ds, _doc_mask_config(document_masking=True)
+    )
+
+    steps = [r for r in _read_jsonl(result.log_path) if r["type"] == "step"]
+    assert len(steps) == 40
+    assert all(math.isfinite(r["train_loss"]) for r in steps)
+    early = sum(r["train_loss"] for r in steps[:5]) / 5
+    late = sum(r["train_loss"] for r in steps[-5:]) / 5
+    assert late < early
+
+
+def test_trainer_document_masking_requires_segment_yielding_dataset(tmp_path):
+    """design.md Error Handling: `document_masking=True` with a plain
+    `(x, y)` dataset raises eagerly with an actionable message."""
+    model = QwenMoEModel(_tiny_model_config())
+    plain_train, plain_val = _repeating_datasets()
+
+    with pytest.raises(ValueError, match="return_segments=True"):
+        Trainer(tmp_path).fit(
+            model, plain_train, plain_val, _doc_mask_config(document_masking=True)
+        )
+
+
+def test_forward_backward_step_segment_ids_none_matches_plain_cross_entropy():
+    """Requirement 10.3: passing `segment_ids=None` explicitly is identical
+    to the pre-spec step (no document mask is ever built)."""
+    torch.manual_seed(0)
+    config = _tiny_model_config()
+    model = QwenMoEModel(config)
+    optimizer = build_optimizer(model, _step_config())
+    x = torch.randint(0, config.vocab_size, (2, 8))
+    y = torch.randint(0, config.vocab_size, (2, 8))
+
+    model.train()
+    with torch.no_grad():
+        logits, _ = model(x)
+        ref = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1)).item()
+
+    metrics, _gn = _forward_backward_step(
+        model, optimizer, x, y, grad_clip_norm=1.0, device="cpu",
+        precision="fp32", z_loss_weight=0.0, segment_ids=None,
+    )
+    assert metrics["lm_loss"] == pytest.approx(ref, rel=1e-6)

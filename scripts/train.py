@@ -50,6 +50,9 @@ def _load_prepared_data(config: DataConfig) -> tuple[torch.Tensor, dict]:
         "tokenizer_type": config.tokenizer_type,
         "tokenizer_path": str(tokenizer_path),
         "vocab_size": tokenizer.vocab_size,
+        # moe-modernization Requirement 10.1: the document separator id, or
+        # None unless prepared with `--split-documents`.
+        "eos_id": getattr(tokenizer, "eos_id", None),
     }
     return tokens, tokenizer_meta
 
@@ -78,6 +81,19 @@ def main() -> None:
     parser.add_argument("--device", choices=["auto", "mps", "cpu"], default="auto")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--resume-from", type=Path, default=None)
+    parser.add_argument(
+        "--val-split-mode",
+        choices=["tail", "documents"],
+        default="tail",
+        help="'documents' holds out whole <eos>-separated documents "
+        "(moe-modernization Requirement 10.4; needs data prepared with --split-documents)",
+    )
+    parser.add_argument(
+        "--document-masking",
+        action="store_true",
+        help="block attention across packed-document boundaries "
+        "(moe-modernization Requirement 10.2; needs data prepared with --split-documents)",
+    )
     args = parser.parse_args()
 
     data_config = DataConfig(
@@ -85,11 +101,22 @@ def main() -> None:
         tokenizer_type=args.tokenizer_type,
         bpe_vocab_size=args.bpe_vocab_size,
         cache_dir=args.cache_dir,
+        val_split_mode=args.val_split_mode,
     )
     tokens, tokenizer_meta = _load_prepared_data(data_config)
-    train_tokens, val_tokens = train_val_split(tokens)
-    train_dataset = TokenDataset(train_tokens, args.seq_len)
-    val_dataset = TokenDataset(val_tokens, args.seq_len)
+    eos_id = tokenizer_meta["eos_id"]
+    if (args.document_masking or args.val_split_mode == "documents") and eos_id is None:
+        raise ValueError(
+            "--document-masking / --val-split-mode=documents need a corpus prepared with "
+            "'uv run python scripts/prepare_data.py ... --split-documents' (no eos_id found)"
+        )
+
+    train_tokens, val_tokens = train_val_split(
+        tokens, mode=args.val_split_mode, eos_id=eos_id
+    )
+    segment_kwargs = dict(return_segments=args.document_masking, eos_id=eos_id)
+    train_dataset = TokenDataset(train_tokens, args.seq_len, **segment_kwargs)
+    val_dataset = TokenDataset(val_tokens, args.seq_len, **segment_kwargs)
 
     if not hasattr(presets, args.preset):
         raise ValueError(f"no preset named {args.preset!r} in configs/presets.py")
@@ -111,6 +138,7 @@ def main() -> None:
         log_interval_steps=args.log_interval_steps,
         device=args.device,
         seed=args.seed,
+        document_masking=args.document_masking,
     )
 
     torch.manual_seed(args.seed)

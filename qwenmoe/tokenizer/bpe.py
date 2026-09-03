@@ -49,19 +49,33 @@ class ByteBPETokenizer:
     alone (zero merges learned yet).
     """
 
-    def __init__(self, target_vocab_size: int = 4096):
+    def __init__(self, target_vocab_size: int = 4096, *, eos_token: bool = False):
         if target_vocab_size < _BASE_VOCAB_SIZE:
             raise ValueError(
                 f"target_vocab_size must be >= {_BASE_VOCAB_SIZE} (the byte-level base "
                 f"vocabulary), got {target_vocab_size}"
             )
         self._target_vocab_size = target_vocab_size
+        # moe-modernization Requirement 10.1: when `eos_token` is on, one id
+        # past the learned byte+merge vocab is reserved as a dedicated
+        # document separator. `encode` never emits it (it isn't a byte
+        # value); `scripts/prepare_data.py` splices it between packed
+        # documents explicitly, and `decode` drops it. Off by default, so a
+        # tokenizer written before this spec is unchanged (same
+        # `vocab_size`, same ids).
+        self._eos_token = eos_token
         self._merges: dict[tuple[int, int], int] = {}
         self._vocab: dict[int, bytes] = {i: bytes([i]) for i in range(_BASE_VOCAB_SIZE)}
 
     @property
     def vocab_size(self) -> int:
-        return len(self._vocab)
+        return len(self._vocab) + (1 if self._eos_token else 0)
+
+    @property
+    def eos_id(self) -> int | None:
+        """The reserved document-separator id (`None` unless constructed
+        with `eos_token=True`): the first id past the byte+merge vocab."""
+        return len(self._vocab) if self._eos_token else None
 
     def train(self, text: str) -> None:
         ids = list(text.encode("utf-8"))
@@ -93,8 +107,9 @@ class ByteBPETokenizer:
         return ids
 
     def decode(self, ids: list[int]) -> str:
+        eos_id = self.eos_id
         try:
-            byte_seq = b"".join(self._vocab[i] for i in ids)
+            byte_seq = b"".join(self._vocab[i] for i in ids if i != eos_id)
         except KeyError as e:
             raise ValueError(
                 f"token id {e.args[0]} out of range for vocab_size={self.vocab_size}"
@@ -106,12 +121,14 @@ class ByteBPETokenizer:
         payload = {
             "target_vocab_size": self._target_vocab_size,
             "merges": [[a, b] for (a, b), _new_id in ordered_merges],
+            "eos_token": self._eos_token,
         }
         Path(path).write_text(json.dumps(payload))
 
     def load(self, path: str | Path) -> None:
         data = json.loads(Path(path).read_text())
         self._target_vocab_size = data["target_vocab_size"]
+        self._eos_token = data.get("eos_token", False)  # pre-spec files have no eos
         self._merges = {}
         self._vocab = {i: bytes([i]) for i in range(_BASE_VOCAB_SIZE)}
         for i, (a, b) in enumerate(data["merges"]):

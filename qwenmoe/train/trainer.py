@@ -1,11 +1,14 @@
 """Training loop (Requirement 5): AdamW or Muon (`TrainConfig.optimizer`,
 moe-modernization Requirement 1) with a warmup + cosine-or-WSD
 learning-rate schedule, gradient clipping, optional bf16 autocast +
-output z-loss (moe-modernization Requirement 3), device auto-selection
-(`mps` else `cpu`), periodic console + JSON-lines logging of per-step
-metrics (now including gradient norm and z-loss) and per-expert token
-counts (consumed later by the training-observability scenes, task 14),
-periodic validation loss/perplexity, and checkpoint save/resume.
+output z-loss (moe-modernization Requirement 3), optional cross-document
+attention masking (moe-modernization Requirement 10, `TrainConfig.
+document_masking` -- consumes `(x, y, segment_ids)` batches from a
+`TokenDataset(return_segments=True)`), device auto-selection (`mps` else
+`cpu`), periodic console + JSON-lines logging of per-step metrics (now
+including gradient norm and z-loss) and per-expert token counts (consumed
+later by the training-observability scenes, task 14), periodic validation
+loss/perplexity, and checkpoint save/resume.
 """
 from __future__ import annotations
 
@@ -175,6 +178,7 @@ def _forward_backward_step(
     device: str = "cpu",
     precision: Literal["fp32", "bf16"] = "fp32",
     z_loss_weight: float = 0.0,
+    segment_ids: torch.Tensor | None = None,
 ) -> tuple[dict, float]:
     """One optimizer step. Returns `(metrics, grad_norm)` where `metrics` is
     a dict of Python floats (or `None` / `list[float]`) with keys
@@ -197,6 +201,12 @@ def _forward_backward_step(
     `model.config.mtp_lambda * mean(mtp_losses)`. With `mtp_depth == 0` the
     model has no MTP heads and `targets` is ignored -- the forward is
     byte-identical to before this task.
+
+    Document masking (moe-modernization Requirement 10.2): `segment_ids`
+    (`(batch, seq_len)` int, or `None`) is forwarded to the model, which
+    turns it into an attention mask blocking cross-document attention.
+    `None` (the trainer passes it only when `TrainConfig.document_masking`)
+    -> forward byte-identical to before this task (Requirement 10.3).
     """
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -207,7 +217,7 @@ def _forward_backward_step(
         else contextlib.nullcontext()
     )
     with autocast_ctx:
-        logits, extras = model(x, targets=y)
+        logits, extras = model(x, targets=y, segment_ids=segment_ids)
 
     logits = logits.float()  # loss + z-loss always in fp32 (Requirement 3.1)
     loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
@@ -261,6 +271,7 @@ def _run_step(
     step: int,
     total_steps: int,
     config: TrainConfig,
+    segment_ids: torch.Tensor | None = None,
 ) -> tuple[dict, float, float, str, QwenMoEModel]:
     """Runs one training step, falling back to `cpu` if a real `RuntimeError`
     hits mid-step on `mps` (design.md Error Handling: "MPS unavailable/errors
@@ -269,8 +280,13 @@ def _run_step(
     bf16 autocast path). Returns `(metrics, grad_norm, current_lr, device,
     model)` -- the (possibly updated) `device`/`model` so the caller keeps
     using them for subsequent steps.
+
+    `segment_ids` (moe-modernization Requirement 10.2) is moved to `device`
+    alongside `x`/`y` and passed through for document masking; `None` when
+    `TrainConfig.document_masking` is off.
     """
     current_lr = _set_lr(optimizer, config.lr, step, total_steps, config)
+    seg = segment_ids.to(device) if segment_ids is not None else None
     try:
         metrics, grad_norm = _forward_backward_step(
             model,
@@ -281,6 +297,7 @@ def _run_step(
             device,
             config.precision,
             config.z_loss_weight,
+            seg,
         )
     except RuntimeError as exc:
         if device != "mps":
@@ -293,6 +310,7 @@ def _run_step(
         model = model.to("cpu")
         _move_optimizer_state_to_device(optimizer, "cpu")
         device = "cpu"
+        seg = segment_ids.to(device) if segment_ids is not None else None
         metrics, grad_norm = _forward_backward_step(
             model,
             optimizer,
@@ -302,6 +320,7 @@ def _run_step(
             device,
             config.precision,
             config.z_loss_weight,
+            seg,
         )
     return metrics, grad_norm, current_lr, device, model
 
@@ -313,13 +332,21 @@ def _evaluate(
     `max_eval_batches` of `val_loader` (Requirement 5.3) -- capped so
     evaluating doesn't require a full pass over a potentially huge
     validation split every `eval_interval_steps`.
+
+    A `val_loader` over a `TokenDataset(return_segments=True)` yields
+    `(x, y, segment_ids)`; the segment ids are forwarded so validation
+    perplexity is measured under the same document masking as training
+    (moe-modernization Requirement 10.2). A plain 2-tuple loader is
+    unchanged.
     """
     model.eval()
     total_loss = 0.0
     n_batches = 0
     with torch.no_grad():
-        for x, y in itertools.islice(val_loader, max_eval_batches):
-            logits, _ = model(x.to(device))
+        for batch in itertools.islice(val_loader, max_eval_batches):
+            x, y = batch[0], batch[1]
+            segment_ids = batch[2].to(device) if len(batch) == 3 else None
+            logits, _ = model(x.to(device), segment_ids=segment_ids)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.to(device).reshape(-1))
             total_loss += loss.item()
             n_batches += 1
@@ -400,6 +427,12 @@ class Trainer:
                 f"val_dataset has {len(val_dataset)} windows, fewer than "
                 f"batch_size ({config.batch_size}); cannot form a single batch"
             )
+        if config.document_masking and len(train_dataset[0]) != 3:
+            raise ValueError(
+                "TrainConfig.document_masking=True requires a train_dataset that yields "
+                "(x, y, segment_ids) -- construct TokenDataset with return_segments=True "
+                "(and an eos_id)"
+            )
 
         device = select_device(config.device)
         torch.manual_seed(config.seed)
@@ -449,7 +482,11 @@ class Trainer:
 
         with self.log_path.open("a", encoding="utf-8") as log_file:
             while global_step < total_steps:
-                x, y = next(train_iter)
+                batch = next(train_iter)
+                x, y = batch[0], batch[1]
+                # (x, y, segment_ids) from a return_segments dataset -- only
+                # consumed when document masking is on (Requirement 10.2/10.3).
+                segment_ids = batch[2] if (config.document_masking and len(batch) == 3) else None
 
                 step_start = time.perf_counter()
                 metrics, grad_norm, current_lr, device, model = _run_step(
@@ -461,6 +498,7 @@ class Trainer:
                     global_step,
                     total_steps,
                     config,
+                    segment_ids,
                 )
                 elapsed = time.perf_counter() - step_start
 

@@ -190,16 +190,36 @@
     parent journal hit, min-p paper link, worked distribution example.
   - _Requirements: 11.1, 11.2, 11.3, 11.4_
 
-- [ ] 15. Data pipeline: document boundaries
-  - BPE `<eos>`/separator id; `prepare_data.py` joins docs with it and
-    records `eos_id`. `TokenDataset(return_segments=True)`;
-    `build_document_mask`; `Attention` combines it with the causal mask when
-    `document_masking`. `train_val_split(mode="documents", eos_id=...)`.
-  - Tests: `document_masking=False` ⇒ identical to today; with it on, a
-    token can't attend across a separator; document-mode val split contains
-    only whole documents.
-  - Journal: cross-document contamination, sequence packing without
-    contamination, Llama-3 doc-mask, a worked mask example.
+- [x] 15. Data pipeline: document boundaries
+  - Opt-in `ByteBPETokenizer(eos_token=True)` reserves a separator id (one
+    past the learned vocab, exposed as `.eos_id`, dropped on `decode`,
+    round-tripped through `save`/`load`); `scripts/prepare_data.py
+    --split-documents` splits the raw corpus on `<|endoftext|>`, encodes
+    each document independently, and joins with `eos_id` (pure helpers
+    `split_documents` / `encode_corpus`). `TokenDataset(return_segments=
+    True, eos_id=...)` yields `(x, y, segment_ids)` with per-window,
+    rebased document ids (`<eos>` = last token of the doc it ends).
+    `build_document_mask(segment_ids)` in `model/attention.py` →
+    `(B, 1, S, S)` additive `0`/`-inf` mask; `Attention.forward` /
+    `MLAAttention.forward` / `TransformerBlock.forward` /
+    `QwenMoEModel.forward` thread `document_mask` / `segment_ids` through
+    (one mask built per forward, shared across blocks). `Trainer` consumes
+    3-tuples when `TrainConfig.document_masking` and raises eagerly
+    otherwise; `train_val_split(tokens, *, mode="documents", eos_id=...)`
+    holds out whole documents from the tail. `tokenizer_meta` carries
+    `eos_id`; `scripts/train.py` gains `--val-split-mode` /
+    `--document-masking`.
+  - Tests (+27, 332 → 359): `document_masking`/`segment_ids` off ⇒
+    `torch.equal` to today (attention + full model); a document-1 token is
+    bit-identical under a document-0 perturbation (`Attention`, all
+    positional schemes, MLA, full model); `train_val_split(mode=
+    "documents")` splits only on separators; BPE `eos_token` reserves one
+    id and is dropped on decode; `encode_corpus` inserts exactly one
+    separator per document.
+  - Journal: `journey_of_a_model/031-document-boundaries.md` — packing,
+    cross-document contamination (measured 78.4% → 0% attention leakage),
+    the additive two-mask composition, worked `segment_ids` + mask
+    examples, Llama-3 / Zhao et al. 2024 / Krell et al. 2021.
   - _Requirements: 10.1, 10.2, 10.3, 10.4_
 
 - [ ] 16. Ablation methodology: multi-seed, param-matched, mean ± std

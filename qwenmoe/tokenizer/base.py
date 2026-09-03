@@ -29,12 +29,19 @@ class Tokenizer(Protocol):
     def load(self, path: str | Path) -> None: ...
 
 
-def build_tokenizer(config: DataConfig) -> Tokenizer:
-    """Constructs the tokenizer named by `config.tokenizer_type`."""
+def build_tokenizer(config: DataConfig, *, eos_token: bool = False) -> Tokenizer:
+    """Constructs the tokenizer named by `config.tokenizer_type`.
+
+    `eos_token` (moe-modernization Requirement 10.1, only meaningful for
+    `"bpe"`): reserve a dedicated document-separator id -- set by
+    `scripts/prepare_data.py --split-documents` when packing a
+    multi-document corpus. `CharTokenizer` (tiny-Shakespeare, a single
+    document) ignores it.
+    """
     if config.tokenizer_type == "char":
         return CharTokenizer()
     if config.tokenizer_type == "bpe":
-        return ByteBPETokenizer(config.bpe_vocab_size)
+        return ByteBPETokenizer(config.bpe_vocab_size, eos_token=eos_token)
     raise ValueError(f"Unknown tokenizer_type: {config.tokenizer_type!r}")
 
 

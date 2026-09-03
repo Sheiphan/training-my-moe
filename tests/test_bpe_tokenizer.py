@@ -75,3 +75,41 @@ def test_build_tokenizer_selects_byte_bpe_tokenizer():
     assert isinstance(tok, ByteBPETokenizer)
     assert isinstance(tok, Tokenizer)
     assert tok.vocab_size == 256  # untrained: base byte vocab only, not the target yet
+
+
+# -- reserved <eos> / document separator (moe-modernization Requirement 10.1)
+
+
+def test_eos_token_off_by_default_and_leaves_vocab_size_unchanged():
+    tok = ByteBPETokenizer(target_vocab_size=280)
+    tok.train(CORPUS)
+    assert tok.eos_id is None
+    assert tok.vocab_size == 280
+
+
+def test_eos_token_reserves_one_id_past_the_learned_vocab():
+    tok = ByteBPETokenizer(target_vocab_size=280, eos_token=True)
+    tok.train(CORPUS)
+    assert tok.vocab_size == 281
+    assert tok.eos_id == 280
+    # encode never emits it; it is not a byte value
+    assert tok.eos_id not in tok.encode(CORPUS)
+
+
+def test_decode_drops_the_eos_token():
+    tok = ByteBPETokenizer(target_vocab_size=280, eos_token=True)
+    tok.train(CORPUS)
+    ids = tok.encode("hello") + [tok.eos_id] + tok.encode("world")
+    assert tok.decode(ids) == "helloworld"
+
+
+def test_save_load_round_trips_the_eos_flag(tmp_path):
+    tok = ByteBPETokenizer(target_vocab_size=280, eos_token=True)
+    tok.train(CORPUS)
+    path = tmp_path / "bpe.json"
+    tok.save(path)
+
+    loaded = ByteBPETokenizer()  # eos_token defaults False; load() must restore it
+    loaded.load(path)
+    assert loaded.eos_id == tok.eos_id
+    assert loaded.vocab_size == tok.vocab_size

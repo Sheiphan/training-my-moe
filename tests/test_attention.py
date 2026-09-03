@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from qwenmoe.config import ModelConfig
-from qwenmoe.model.attention import Attention
+from qwenmoe.model.attention import Attention, build_document_mask
 
 
 def _tiny_config(**overrides):
@@ -111,6 +111,54 @@ def test_qk_norm_bounds_attention_logit_scale_regardless_of_input_magnitude():
     assert std_on_unit < 5.0
     assert std_on_large < 5.0  # bounded: ~unchanged across a 200x input scale-up
     assert std_on_large / std_on_unit < 5.0  # nowhere near the off-path's blowup
+
+
+# -- document masking (moe-modernization Requirement 10.2, 10.3) ------------
+
+
+def test_build_document_mask_zero_within_document_neg_inf_across():
+    segment_ids = torch.tensor([[0, 0, 1, 1, 1]])
+    mask = build_document_mask(segment_ids)
+    assert mask.shape == (1, 1, 5, 5)
+    assert (mask[0, 0, :2, :2] == 0.0).all()
+    assert (mask[0, 0, 2:, 2:] == 0.0).all()
+    assert torch.isneginf(mask[0, 0, :2, 2:]).all()
+    assert torch.isneginf(mask[0, 0, 2:, :2]).all()
+
+
+def test_document_mask_none_is_numerically_identical_to_today():
+    """Requirement 10.3: with no document mask the forward is byte-for-byte
+    the pre-spec path (the default arg literally isn't referenced)."""
+    torch.manual_seed(0)
+    attn = Attention(_tiny_config(n_heads=4, n_kv_heads=2))
+    x = torch.randn(2, 5, 16)
+    positions = torch.arange(5)
+    with torch.no_grad():
+        assert torch.equal(attn(x, positions), attn(x, positions, document_mask=None))
+
+
+def test_document_mask_blocks_attention_across_a_separator():
+    """A token in the second packed document must be completely unaffected
+    by any change to the first document's tokens (Requirement 10.2)."""
+    torch.manual_seed(0)
+    config = _tiny_config(n_heads=2, n_kv_heads=2, positional_scheme="nope")
+    attn = Attention(config)
+    positions = torch.arange(5)
+    segment_ids = torch.tensor([[0, 0, 0, 1, 1]])  # docs: {0,1,2} then {3,4}
+    document_mask = build_document_mask(segment_ids)
+
+    x = torch.randn(1, 5, config.d_model)
+    x_perturbed = x.clone()
+    x_perturbed[:, 0, :] += 50.0  # perturb a document-0 token
+
+    with torch.no_grad():
+        out = attn(x, positions, document_mask=document_mask)
+        out_perturbed = attn(x_perturbed, positions, document_mask=document_mask)
+
+    # document-1 positions (3, 4): identical -- the separator blocked the influence
+    assert torch.allclose(out[:, 3:, :], out_perturbed[:, 3:, :], atol=1e-6)
+    # document-0 positions still see it (positions 1, 2 attend back to position 0)
+    assert not torch.allclose(out[:, 1:3, :], out_perturbed[:, 1:3, :], atol=1e-4)
 
 
 def test_causal_mask_blocks_future_influence():

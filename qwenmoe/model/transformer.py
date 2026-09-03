@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from qwenmoe.config import ModelConfig
+from qwenmoe.model.attention import build_document_mask
 from qwenmoe.model.block import TransformerBlock
 from qwenmoe.model.mtp import MTPHead
 from qwenmoe.model.rmsnorm import RMSNorm
@@ -93,22 +94,37 @@ class QwenMoEModel(nn.Module):
         targets: torch.Tensor | None = None,
         kv_caches: list | None = None,
         position_offset: int = 0,
+        segment_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         """`kv_caches` / `position_offset` (moe-modernization Requirement 8,
         both inert defaults): `generate(use_kv_cache=True)` passes one cache
         per block plus the absolute position of `input_ids[:, 0]`, so an
         incremental decode step feeds a single token and its true position.
         With the defaults this is exactly the pre-spec forward.
+
+        `segment_ids` (moe-modernization Requirement 10.2, `None` unless the
+        trainer runs with `TrainConfig.document_masking`): a `(batch,
+        seq_len)` integer document id per position. It is turned into one
+        shared `(batch, 1, seq_len, seq_len)` additive mask here and handed
+        to every block, so a token never attends across a packed-document
+        boundary. `segment_ids=None` -> `document_mask=None` everywhere ->
+        byte-identical to the pre-spec forward (Requirement 10.3).
         """
         seq_len = input_ids.shape[1]
         positions = torch.arange(
             position_offset, position_offset + seq_len, device=input_ids.device
         )
+        document_mask = build_document_mask(segment_ids) if segment_ids is not None else None
 
         x = self.embedding(input_ids)
         aux_losses = []
         for i, block in enumerate(self.blocks):
-            x, aux_loss = block(x, positions, kv_cache=kv_caches[i] if kv_caches else None)
+            x, aux_loss = block(
+                x,
+                positions,
+                kv_cache=kv_caches[i] if kv_caches else None,
+                document_mask=document_mask,
+            )
             if aux_loss is not None:
                 aux_losses.append(aux_loss)
 

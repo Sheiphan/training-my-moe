@@ -31,7 +31,8 @@ def _causal_position_mask(
     absolute position, `-inf` otherwise.
 
     Only built on the paths `F.scaled_dot_product_attention(is_causal=True)`
-    can't serve directly -- an ALiBi bias to fold in, or a KV-cache
+    can't serve directly -- an ALiBi bias to fold in, a document-boundary
+    mask to fold in (moe-modernization Requirement 10), or a KV-cache
     incremental step whose query positions don't line up `1:1` with the key
     positions (moe-modernization Requirement 8). For the ordinary
     `q_positions == arange(seq_len)`, `kv_len == seq_len` case it is exactly
@@ -42,6 +43,31 @@ def _causal_position_mask(
     mask = torch.zeros(q_positions.shape[0], kv_len, device=device, dtype=dtype)
     mask.masked_fill_(~allowed, float("-inf"))
     return mask.unsqueeze(0)
+
+
+def build_document_mask(segment_ids: torch.Tensor) -> torch.Tensor:
+    """`(batch, seq_len)` integer document ids -> a `(batch, 1, seq_len,
+    seq_len)` additive attention mask (moe-modernization Requirement 10.2):
+    `0.0` where query position `i` and key position `j` fall in the *same*
+    document, `-inf` where they fall in different documents.
+
+    Added onto the causal mask inside `Attention` / `MLAAttention` when
+    `TrainConfig.document_masking` is on, it stops a token attending back
+    across a `<eos>`/separator boundary into a previous packed document --
+    so a training window that concatenates several short stories is
+    attended over as if each story were its own sequence (Llama-3's
+    intra-document masking). The head axis is size 1 and broadcasts across
+    all query heads inside SDPA. Never built when `document_masking` is off,
+    so a pre-spec run carries no extra work (Requirement 10.3).
+    """
+    if segment_ids.dim() != 2:
+        raise ValueError(
+            f"segment_ids must be (batch, seq_len), got shape {tuple(segment_ids.shape)}"
+        )
+    same_document = segment_ids[:, :, None] == segment_ids[:, None, :]  # (batch, S, S)
+    mask = torch.zeros(same_document.shape, dtype=torch.float32, device=segment_ids.device)
+    mask.masked_fill_(~same_document, float("-inf"))
+    return mask.unsqueeze(1)
 
 
 def build_positional_scheme(config: ModelConfig, head_dim: int) -> nn.Module:
@@ -91,7 +117,7 @@ class Attention(nn.Module):
             self.k_norm = RMSNorm(self.head_dim)
 
     def forward(
-        self, x: torch.Tensor, positions: torch.Tensor, kv_cache=None
+        self, x: torch.Tensor, positions: torch.Tensor, kv_cache=None, document_mask=None
     ) -> torch.Tensor:
         """moe-modernization Requirement 7.1-7.2: the non-trace path calls
         fused `F.scaled_dot_product_attention` instead of materializing an
@@ -106,12 +132,20 @@ class Attention(nn.Module):
         training call): a `LayerKVCache`. The freshly-projected, RoPE'd
         `k`/`v` for *this* call's tokens are appended to it and the full
         running `k`/`v` come back, so an incremental decode step attends
-        over the whole prefix without re-encoding it. When the query
-        positions no longer line up `1:1` with the keys (an incremental
-        step: one query, `N` keys) or an ALiBi bias must be folded in, an
-        explicit additive `attn_mask` replaces `is_causal=True`; addition
-        is commutative so the ALiBi-plus-causal total is identical to the
-        old bias-then-mask sequence.
+        over the whole prefix without re-encoding it.
+
+        `document_mask` (moe-modernization Requirement 10.2, `None` unless
+        `TrainConfig.document_masking` is on): a `(batch, 1, seq_len,
+        seq_len)` additive `0`/`-inf` mask from `build_document_mask` that
+        blocks attention across packed-document boundaries.
+
+        When the query positions no longer line up `1:1` with the keys (an
+        incremental step: one query, `N` keys), an ALiBi bias must be
+        folded in, or a document mask is supplied, an explicit additive
+        `attn_mask` replaces `is_causal=True`; addition is commutative and
+        associative so the causal-plus-ALiBi-plus-document total is
+        order-independent and, with `document_mask=None`, byte-identical to
+        the pre-spec path (Requirement 10.3).
         """
         batch, seq_len, _ = x.shape
 
@@ -131,12 +165,14 @@ class Attention(nn.Module):
 
         key_positions = torch.arange(kv_len, device=x.device)
         bias = self.positional.attention_bias_positions(positions, key_positions)
-        if bias is None and kv_len == seq_len:
+        if bias is None and document_mask is None and kv_len == seq_len:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         else:
             attn_mask = _causal_position_mask(positions, kv_len, x.device, q.dtype)
             if bias is not None:
                 attn_mask = attn_mask + bias.to(q.dtype).unsqueeze(0)
+            if document_mask is not None:
+                attn_mask = attn_mask + document_mask.to(q.dtype)
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, enable_gqa=True
             )
@@ -269,7 +305,7 @@ class MLAAttention(nn.Module):
         return self.latent_dim + self.rope_head_dim
 
     def forward(
-        self, x: torch.Tensor, positions: torch.Tensor, kv_cache=None
+        self, x: torch.Tensor, positions: torch.Tensor, kv_cache=None, document_mask=None
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
 
@@ -302,11 +338,16 @@ class MLAAttention(nn.Module):
         # its own decoupled RoPE. SDPA's default scale (1/sqrt(q's last dim))
         # already equals 1/sqrt(head_dim + rope_head_dim) since q is exactly
         # that wide. An incremental cache step (query positions not lined up
-        # 1:1 with the keys) needs an explicit mask instead of `is_causal`.
-        if kv_len == seq_len:
+        # 1:1 with the keys) or a document mask (moe-modernization
+        # Requirement 10.2) needs an explicit additive mask instead of
+        # `is_causal`; with `document_mask=None` and no cache this is
+        # byte-identical to the pre-spec path.
+        if document_mask is None and kv_len == seq_len:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
             attn_mask = _causal_position_mask(positions, kv_len, x.device, q.dtype)
+            if document_mask is not None:
+                attn_mask = attn_mask + document_mask.to(q.dtype)
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.n_heads * self.head_dim)

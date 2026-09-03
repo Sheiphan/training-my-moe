@@ -65,6 +65,40 @@ def test_model_output_shape_for_multiple_batch_seq_len_combos(batch, seq_len):
     assert torch.isfinite(extras["aux_loss"])
 
 
+# -- document masking (moe-modernization Requirement 10.2, 10.3) ------------
+
+
+def test_segment_ids_none_is_identical_to_the_pre_spec_forward():
+    """Requirement 10.3: `segment_ids=None` (the default) must reproduce the
+    exact logits of a call that never passes the argument at all."""
+    torch.manual_seed(0)
+    model = QwenMoEModel(_tiny_config()).eval()
+    ids = torch.randint(0, model.config.vocab_size, (2, 6))
+    with torch.no_grad():
+        a, _ = model(ids)
+        b, _ = model(ids, segment_ids=None)
+    assert torch.equal(a, b)
+
+
+def test_segment_ids_block_cross_document_influence_end_to_end():
+    """Requirement 10.2: changing a token in document 0 leaves every
+    document-1 logit exactly unchanged when segment ids are supplied."""
+    torch.manual_seed(0)
+    model = QwenMoEModel(_tiny_config(positional_scheme="nope")).eval()
+    ids = torch.randint(0, model.config.vocab_size, (1, 6))
+    segment_ids = torch.tensor([[0, 0, 0, 1, 1, 1]])
+
+    perturbed = ids.clone()
+    perturbed[0, 1] = (perturbed[0, 1] + 3) % model.config.vocab_size
+
+    with torch.no_grad():
+        base, _ = model(ids, segment_ids=segment_ids)
+        changed, _ = model(perturbed, segment_ids=segment_ids)
+
+    assert torch.equal(base[:, 3:, :], changed[:, 3:, :])  # document 1 untouched
+    assert not torch.equal(base[:, 1:3, :], changed[:, 1:3, :])  # document 0 does change
+
+
 def test_tied_embeddings_share_weight_tensor():
     """Requirement 1.7."""
     config = _tiny_config(tie_word_embeddings=True)
