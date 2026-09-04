@@ -9,36 +9,34 @@
 </head>
 <body>
 
+<nav class="pagenav">
+  <a href="architecture.html">&larr; Architecture explorer</a>
+  <span class="here">Token journey</span>
+  <a href="../ablation_study/index.html">Ablation study &rarr;</a>
+  <span class="sep">token_journey &middot; real-trace view</span>
+</nav>
+
 <header>
   <h1>Token Journey</h1>
   <p class="subtitle">
-    Follow one real token through one real forward pass of a trained SMOKE_TEST-derived checkpoint,
-    one operation at a time. Toggle Attention/Positional below to see a REAL trained checkpoint for
-    that combination — the diagram and math both change to match. Click <code>&#9654; Play</code> to
-    auto-advance, or step through manually with the rail, arrow keys, or Prev/Next — every number
-    shown is real, captured via <code>qwenmoe/model/trace.py</code>, never illustrative.
+    Follow one real token through one real forward pass, one operation at a time. Pick an architecture
+    below and the diagram, the narrative and the arithmetic all change to match a
+    <strong>real trained checkpoint</strong> of that exact configuration — including steps that only
+    exist in some architectures. Press <code>&#9654; Play</code> to auto-advance, or step through with the
+    rail, the arrow keys, or Prev/Next. Every number is captured via
+    <code>QwenMoEModel.forward_with_trace</code>; nothing is illustrative.
   </p>
 </header>
 
-<div id="controls">
-  <div class="ctrl-group" data-key="attention">
-    <span class="ctrl-label">Attention</span>
-    <button data-value="gqa">GQA</button>
-    <button data-value="mla">MLA</button>
-  </div>
-  <div class="ctrl-group" data-key="positional">
-    <span class="ctrl-label">Positional</span>
-    <button data-value="rope">RoPE</button>
-    <button data-value="nope">NoPE</button>
-    <button data-value="alibi">ALiBi</button>
-  </div>
-</div>
-<p class="axis-note">Both toggles use real trained checkpoints from <code>scripts/run_ablation_study.py</code> —
-  MLA always applies its own decoupled RoPE regardless of Positional, so picking MLA resets Positional
-  to RoPE (and picking any Positional resets Attention back to GQA).</p>
+<div id="variant-picker"></div>
+
+<div id="arch-summary" aria-live="polite"></div>
+
+<p class="axis-note" id="variant-note"></p>
 
 <div class="main-col">
   <div id="diagram-wrap">
+    <div id="diagram-loading" class="loading-veil" hidden><span class="spinner"></span><span id="loading-text">Loading trace…</span></div>
     <svg id="diagram" viewBox="0 0 1000 700" preserveAspectRatio="xMidYMid meet"></svg>
   </div>
 
@@ -69,7 +67,7 @@
 
 <script src="lib/d3.min.js"></script>
 <script src="lib/katex.min.js"></script>
-<script src="data/trace.js"></script>
+<script src="data/manifest.js"></script>
 <script src="js/store.js"></script>
 <script src="js/diagram.js"></script>
 <script src="js/camera.js"></script>

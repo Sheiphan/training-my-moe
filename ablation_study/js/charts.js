@@ -1,234 +1,372 @@
 /* ablation_study/js/charts.js
- * Reusable D3 chart primitives for the ablation study page. Every value
- * passed in is real (read from window.ABLATION_DATA) -- these functions
- * only lay out and animate numbers the caller already has.
+ *
+ * D3 chart primitives for the ablation study page. Every value passed in is
+ * real (read from window.ABLATION_DATA, itself written from real
+ * `train.jsonl` files) -- these functions only lay out and animate numbers
+ * the caller already has, they never derive a metric.
+ *
+ * Colours are read from CSS custom properties rather than hard-coded, so
+ * the same chart code renders correctly in both light and dark themes.
  */
 (function () {
   "use strict";
   const AB = (window.AB = window.AB || {});
 
-  function fmt(value, digits) {
-    if (value === null || value === undefined || Number.isNaN(value)) return "—";
-    return value.toFixed(digits ?? 2);
+  function cssVar(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   }
 
-  function fmtInt(value) {
-    return Math.round(value).toLocaleString();
-  }
+  const C = {
+    get control() { return cssVar("--control"); },
+    get variant() { return cssVar("--variant"); },
+    get better() { return cssVar("--better"); },
+    get worse() { return cssVar("--worse"); },
+    get ink3() { return cssVar("--ink-3"); },
+    get border() { return cssVar("--border"); },
+    preset(name) {
+      return { BASELINE: cssVar("--p-baseline"), BASELINE_V2: cssVar("--p-v2"), FINEGRAINED: cssVar("--p-fine") }[name] || cssVar("--control");
+    },
+  };
 
-  /**
-   * opts: { metrics: [{ key, label, baselineValue, variantValue, format,
-   * lowerIsBetter }] } -- one grouped horizontal bar pair per metric.
-   */
-  function renderMetricBars(container, opts) {
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const dur = (ms) => (reduceMotion ? 0 : ms);
+
+  // ---- shared tooltip -----------------------------------------------------
+  let tipEl = null;
+  function tip() {
+    if (!tipEl) {
+      tipEl = document.createElement("div");
+      tipEl.className = "tooltip";
+      document.body.appendChild(tipEl);
+    }
+    return tipEl;
+  }
+  function showTip(event, html) {
+    const el = tip();
+    el.innerHTML = html;
+    el.classList.add("on");
+    const pad = 14;
+    let x = event.clientX + pad;
+    let y = event.clientY + pad;
+    const r = el.getBoundingClientRect();
+    if (x + r.width > window.innerWidth - 8) x = event.clientX - r.width - pad;
+    if (y + r.height > window.innerHeight - 8) y = event.clientY - r.height - pad;
+    el.style.left = x + "px";
+    el.style.top = y + "px";
+  }
+  function hideTip() {
+    if (tipEl) tipEl.classList.remove("on");
+  }
+  AB.hideTip = hideTip;
+
+  function svgIn(container, height) {
     container.innerHTML = "";
-    const width = Math.max(560, container.clientWidth || 560);
-    const rowH = 56;
-    const height = opts.metrics.length * rowH + 20;
-    const svg = d3.select(container).append("svg").attr("width", width).attr("height", height);
-    const labelW = 150;
-    const plotW = width - labelW - 90;
-    const maxScale = d3.scaleLinear();
+    const width = Math.max(520, container.clientWidth || 640);
+    const svg = d3
+      .select(container)
+      .append("svg")
+      .attr("width", width)
+      .attr("height", height)
+      .attr("viewBox", `0 0 ${width} ${height}`);
+    return { svg, width };
+  }
 
-    const legend = d3.select(container).insert("div", "svg").attr("class", "chart-legend");
-    legend.html(
-      `<span><span class="sw" style="background:#94a3b8"></span>Baseline (${opts.baselineLabel})</span>` +
-        `<span><span class="sw" style="background:#7c3aed"></span>${opts.variantLabel}</span>`
+  /* ------------------------------------------------------------------ *
+   * Training curves. `series` is a list of
+   *   { label, color, steps, values, dashed?, band? }
+   * where `band` (optional) is [lowerValues, upperValues] drawn as a
+   * translucent envelope -- used for the multi-seed preset runs, where the
+   * band is the real min/max across seeds and the line is their mean.
+   * ------------------------------------------------------------------ */
+  function renderCurves(container, opts) {
+    const series = opts.series.filter((s) => s.steps && s.steps.length);
+    if (!series.length) {
+      container.innerHTML = '<p style="color:var(--ink-3);font-size:.86rem">No curve data.</p>';
+      return;
+    }
+    const H = opts.height || 300;
+    const { svg, width } = svgIn(container, H);
+    const m = { top: 12, right: 16, bottom: 34, left: 52 };
+    const plotW = width - m.left - m.right;
+    const plotH = H - m.top - m.bottom;
+    const g = svg.append("g").attr("transform", `translate(${m.left},${m.top})`);
+
+    const allSteps = series.flatMap((s) => s.steps);
+    const allVals = series.flatMap((s) => (s.band ? s.band[0].concat(s.band[1]) : s.values));
+    const x = d3.scaleLinear().domain(d3.extent(allSteps)).range([0, plotW]);
+    const yPad = (d3.max(allVals) - d3.min(allVals)) * 0.08 || 0.1;
+    const y = d3
+      .scaleLinear()
+      .domain([d3.min(allVals) - yPad, d3.max(allVals) + yPad])
+      .range([plotH, 0]);
+
+    g.append("g")
+      .attr("class", "grid")
+      .call(d3.axisLeft(y).ticks(5).tickSize(-plotW).tickFormat(""));
+    g.append("g")
+      .attr("class", "axis")
+      .attr("transform", `translate(0,${plotH})`)
+      .call(d3.axisBottom(x).ticks(6).tickFormat(d3.format("d")));
+    g.append("g").attr("class", "axis").call(d3.axisLeft(y).ticks(5).tickFormat(d3.format(".2f")));
+
+    svg
+      .append("text")
+      .attr("class", "chart-label")
+      .attr("x", m.left + plotW / 2)
+      .attr("y", H - 3)
+      .attr("text-anchor", "middle")
+      .text(opts.xLabel || "training step");
+    svg
+      .append("text")
+      .attr("class", "chart-label")
+      .attr("transform", `translate(12,${m.top + plotH / 2}) rotate(-90)`)
+      .attr("text-anchor", "middle")
+      .text(opts.yLabel || "loss");
+
+    series.forEach((s) => {
+      if (s.band) {
+        const area = d3
+          .area()
+          .x((_, i) => x(s.steps[i]))
+          .y0((_, i) => y(s.band[0][i]))
+          .y1((_, i) => y(s.band[1][i]))
+          .curve(d3.curveMonotoneX);
+        g.append("path")
+          .datum(s.steps)
+          .attr("d", area)
+          .attr("fill", s.color)
+          .attr("opacity", 0.14);
+      }
+      const line = d3
+        .line()
+        .x((_, i) => x(s.steps[i]))
+        .y((_, i) => y(s.values[i]))
+        .curve(d3.curveMonotoneX);
+      const path = g
+        .append("path")
+        .datum(s.values)
+        .attr("d", line)
+        .attr("fill", "none")
+        .attr("stroke", s.color)
+        .attr("stroke-width", s.dashed ? 2 : 2.6)
+        .attr("stroke-dasharray", s.dashed ? "5 4" : null)
+        .attr("stroke-linecap", "round");
+      if (!reduceMotion) {
+        const len = path.node().getTotalLength();
+        path
+          .attr("stroke-dasharray", s.dashed ? "5 4" : `${len} ${len}`)
+          .attr("stroke-dashoffset", s.dashed ? 0 : len)
+          .transition()
+          .duration(dur(700))
+          .ease(d3.easeCubicOut)
+          .attr("stroke-dashoffset", 0);
+      }
+    });
+
+    // hover: a vertical rule that reads every series at the nearest step
+    const focus = g.append("g").style("display", "none");
+    focus
+      .append("line")
+      .attr("y1", 0)
+      .attr("y2", plotH)
+      .attr("stroke", C.ink3)
+      .attr("stroke-width", 1)
+      .attr("stroke-dasharray", "3 3");
+    const dots = series.map((s) =>
+      focus.append("circle").attr("r", 4).attr("fill", s.color).attr("stroke", "var(--surface)").attr("stroke-width", 2)
     );
 
-    opts.metrics.forEach((metric, i) => {
-      const y0 = i * rowH + 10;
-      const format = metric.format || ((v) => fmt(v, 3));
-      const maxVal = Math.max(metric.baselineValue, metric.variantValue, 1e-9) * 1.15;
-      const scale = maxScale.domain([0, maxVal]).range([0, plotW]);
-      const better =
-        metric.variantValue === metric.baselineValue
-          ? null
-          : metric.lowerIsBetter
-          ? metric.variantValue < metric.baselineValue
-          : metric.variantValue > metric.baselineValue;
+    g.append("rect")
+      .attr("width", plotW)
+      .attr("height", plotH)
+      .attr("fill", "transparent")
+      .style("cursor", "crosshair")
+      .on("mouseenter", () => focus.style("display", null))
+      .on("mouseleave", () => {
+        focus.style("display", "none");
+        hideTip();
+      })
+      .on("mousemove", (event) => {
+        const [mx] = d3.pointer(event);
+        const step = x.invert(mx);
+        let html = "";
+        focus.attr("transform", null);
+        series.forEach((s, i) => {
+          const idx = d3.leastIndex(s.steps, (a, b) => Math.abs(a - step) - Math.abs(b - step));
+          const sx = x(s.steps[idx]);
+          const sy = y(s.values[idx]);
+          dots[i].attr("cx", sx).attr("cy", sy);
+          if (i === 0) focus.select("line").attr("x1", sx).attr("x2", sx);
+          html += `<div><span style="color:${s.color}">&#9632;</span> ${s.label}: <b>${s.values[idx].toFixed(4)}</b></div>`;
+        });
+        const idx0 = d3.leastIndex(series[0].steps, (a, b) => Math.abs(a - step) - Math.abs(b - step));
+        showTip(event, `<div style="opacity:.7;margin-bottom:3px">step ${series[0].steps[idx0]}</div>${html}`);
+      });
+  }
 
-      const row = svg.append("g").attr("transform", `translate(0,${y0})`);
-      row
-        .append("text")
-        .attr("class", "bar-label")
-        .attr("x", 0)
-        .attr("y", 16)
-        .text(metric.label);
+  /* ------------------------------------------------------------------ *
+   * Expert utilization: grouped bars, one group per layer, one bar per
+   * routed expert, with a dashed "perfectly balanced" reference line.
+   * `groups` is [{ label, counts }].
+   * ------------------------------------------------------------------ */
+  function renderExpertBars(container, opts) {
+    const groups = opts.groups.filter((gr) => gr.counts && gr.counts.length);
+    if (!groups.length) {
+      container.innerHTML = '<p style="color:var(--ink-3);font-size:.86rem">No expert-utilization data logged for this run.</p>';
+      return;
+    }
+    const nLayers = groups[0].counts.length;
+    const nExperts = groups[0].counts[0].length;
+    const H = 78 * nLayers + 46;
+    const { svg, width } = svgIn(container, H);
+    const m = { top: 10, right: 14, bottom: 26, left: 74 };
+    const plotW = width - m.left - m.right;
+    const g = svg.append("g").attr("transform", `translate(${m.left},${m.top})`);
 
-      const baseBar = row
-        .append("rect")
-        .attr("class", "bar-baseline")
-        .attr("x", labelW)
-        .attr("y", 0)
-        .attr("height", 14)
-        .attr("width", 0)
-        .attr("rx", 3);
-      baseBar.transition().duration(500).attr("width", scale(metric.baselineValue));
-      row
-        .append("text")
-        .attr("class", "bar-value")
-        .attr("x", labelW + scale(metric.baselineValue) + 6)
-        .attr("y", 11)
-        .text(format(metric.baselineValue));
+    const rowH = 78;
+    const groupW = plotW / groups.length;
 
-      const varBar = row
-        .append("rect")
-        .attr("class", "bar-variant" + (better === null ? "" : better ? " better" : " worse"))
-        .attr("x", labelW)
-        .attr("y", 20)
-        .attr("height", 14)
-        .attr("width", 0)
-        .attr("rx", 3);
-      varBar.transition().duration(500).delay(80).attr("width", scale(metric.variantValue));
-      row
+    for (let layer = 0; layer < nLayers; layer++) {
+      const rowY = layer * rowH;
+      svg
         .append("text")
-        .attr("class", "bar-value")
-        .attr("x", labelW + scale(metric.variantValue) + 6)
-        .attr("y", 31)
-        .text(format(metric.variantValue));
+        .attr("class", "chart-label")
+        .attr("x", m.left - 10)
+        .attr("y", m.top + rowY + rowH / 2)
+        .attr("text-anchor", "end")
+        .attr("dominant-baseline", "middle")
+        .text(`layer ${layer}`);
+
+      groups.forEach((gr, gi) => {
+        const counts = gr.counts[layer];
+        const total = counts.reduce((a, b) => a + b, 0) || 1;
+        const ideal = 1 / counts.length;
+        const barsY = rowY + 12;
+        const barsH = rowH - 26;
+        const x = d3
+          .scaleBand()
+          .domain(d3.range(counts.length))
+          .range([gi * groupW + 8, (gi + 1) * groupW - 8])
+          .padding(counts.length > 16 ? 0.12 : 0.24);
+        const maxFrac = Math.max(d3.max(counts) / total, ideal * 1.6);
+        const y = d3.scaleLinear().domain([0, maxFrac]).range([barsH, 0]);
+
+        if (layer === 0) {
+          svg
+            .append("text")
+            .attr("class", "chart-label")
+            .attr("x", m.left + gi * groupW + groupW / 2)
+            .attr("y", H - 8)
+            .attr("text-anchor", "middle")
+            .style("font-weight", "650")
+            .style("fill", gr.color)
+            .text(gr.label);
+        }
+
+        const layerG = g.append("g").attr("transform", `translate(0,${barsY})`);
+        layerG
+          .selectAll("rect")
+          .data(counts)
+          .join("rect")
+          .attr("x", (_, i) => x(i))
+          .attr("width", x.bandwidth())
+          .attr("y", barsH)
+          .attr("height", 0)
+          .attr("rx", 1.5)
+          .attr("fill", gr.color)
+          .attr("opacity", (d) => 0.45 + 0.55 * Math.min(1, d / total / (ideal * 2)))
+          .on("mousemove", (event, d) =>
+            showTip(
+              event,
+              `${gr.label} &middot; layer ${layer}<br>expert <b>${counts.indexOf(d)}</b><br>` +
+                `${d.toLocaleString()} tokens (<b>${((d / total) * 100).toFixed(1)}%</b>)<br>` +
+                `<span style="opacity:.7">even share would be ${(ideal * 100).toFixed(1)}%</span>`
+            )
+          )
+          .on("mouseleave", hideTip)
+          .transition()
+          .duration(dur(520))
+          .delay((_, i) => dur(i * 8 + layer * 40))
+          .attr("y", (d) => y(d / total))
+          .attr("height", (d) => barsH - y(d / total));
+
+        layerG
+          .append("line")
+          .attr("class", "ideal-line")
+          .attr("x1", gi * groupW + 8)
+          .attr("x2", (gi + 1) * groupW - 8)
+          .attr("y1", y(ideal))
+          .attr("y2", y(ideal));
+      });
+    }
+    return { nExperts };
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Coefficient-of-variation summary: one dot per layer per variant on a
+   * shared axis. CV = std(load)/mean(load); 0 is perfectly even routing.
+   * ------------------------------------------------------------------ */
+  function renderBalanceDots(container, opts) {
+    const rows = opts.rows.filter((r) => r.cvs && r.cvs.length);
+    if (!rows.length) {
+      container.innerHTML = "";
+      return;
+    }
+    const H = 34 * rows.length + 40;
+    const { svg, width } = svgIn(container, H);
+    const m = { top: 10, right: 22, bottom: 28, left: 118 };
+    const plotW = width - m.left - m.right;
+    const g = svg.append("g").attr("transform", `translate(${m.left},${m.top})`);
+    const maxCv = Math.max(0.35, d3.max(rows.flatMap((r) => r.cvs)) * 1.15);
+    const x = d3.scaleLinear().domain([0, maxCv]).range([0, plotW]);
+
+    g.append("g")
+      .attr("class", "axis")
+      .attr("transform", `translate(0,${rows.length * 34})`)
+      .call(d3.axisBottom(x).ticks(6).tickFormat(d3.format(".2f")));
+    svg
+      .append("text")
+      .attr("class", "chart-label")
+      .attr("x", m.left + plotW / 2)
+      .attr("y", H - 2)
+      .attr("text-anchor", "middle")
+      .text("coefficient of variation across routed experts  (0 = perfectly even)");
+
+    rows.forEach((r, i) => {
+      const yy = i * 34 + 15;
+      svg
+        .append("text")
+        .attr("class", "chart-label")
+        .attr("x", m.left - 10)
+        .attr("y", m.top + yy)
+        .attr("text-anchor", "end")
+        .attr("dominant-baseline", "middle")
+        .style("font-weight", "600")
+        .text(r.label);
+      g.append("line")
+        .attr("x1", 0)
+        .attr("x2", plotW)
+        .attr("y1", yy)
+        .attr("y2", yy)
+        .attr("stroke", C.border);
+      g.selectAll(null)
+        .data(r.cvs)
+        .join("circle")
+        .attr("cy", yy)
+        .attr("r", 5)
+        .attr("fill", r.color)
+        .attr("opacity", 0.75)
+        .attr("cx", 0)
+        .on("mousemove", (event, d) =>
+          showTip(event, `${r.label} &middot; layer ${r.cvs.indexOf(d)}<br>CV = <b>${d.toFixed(3)}</b>`)
+        )
+        .on("mouseleave", hideTip)
+        .transition()
+        .duration(dur(520))
+        .delay((_, j) => dur(j * 50))
+        .attr("cx", (d) => x(d));
     });
   }
 
-  /**
-   * opts: { baseline: {label, steps, train_loss, eval_steps, val_loss},
-   * variant: {label, steps, train_loss, eval_steps, val_loss} }
-   */
-  function renderLossCurve(container, opts) {
-    container.innerHTML = "";
-    const width = Math.max(620, container.clientWidth || 620);
-    const height = 260;
-    const margin = { top: 12, right: 16, bottom: 26, left: 40 };
-    const plotW = width - margin.left - margin.right;
-    const plotH = height - margin.top - margin.bottom;
-
-    const legend = d3.select(container).insert("div", null).attr("class", "chart-legend");
-    legend.html(
-      `<span><span class="sw" style="background:#94a3b8"></span>${opts.baseline.label} (train)</span>` +
-        `<span><span class="sw" style="background:#64748b"></span>${opts.baseline.label} (val)</span>` +
-        `<span><span class="sw" style="background:#a78bfa"></span>${opts.variant.label} (train)</span>` +
-        `<span><span class="sw" style="background:#4338ca"></span>${opts.variant.label} (val)</span>`
-    );
-
-    const allSteps = [...opts.baseline.steps, ...opts.variant.steps];
-    const allLoss = [...opts.baseline.train_loss, ...opts.variant.train_loss, ...opts.baseline.val_loss, ...opts.variant.val_loss];
-    const x = d3.scaleLinear().domain([0, d3.max(allSteps) || 1]).range([0, plotW]);
-    const y = d3.scaleLinear().domain([0, d3.max(allLoss) * 1.08]).range([plotH, 0]);
-
-    const svg = d3.select(container).append("svg").attr("width", width).attr("height", height);
-    const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
-
-    g.append("g").attr("class", "chart-axis").attr("transform", `translate(0,${plotH})`).call(d3.axisBottom(x).ticks(6));
-    g.append("g").attr("class", "chart-axis").call(d3.axisLeft(y).ticks(5));
-
-    function drawLine(xs, ys, cls) {
-      const line = d3
-        .line()
-        .x((d, i) => x(xs[i]))
-        .y((d) => y(d));
-      const path = g.append("path").datum(ys).attr("class", cls).attr("d", line);
-      const length = path.node().getTotalLength();
-      path
-        .attr("stroke-dasharray", `${length} ${length}`)
-        .attr("stroke-dashoffset", length)
-        .transition()
-        .duration(700)
-        .ease(d3.easeCubicOut)
-        .attr("stroke-dashoffset", 0);
-    }
-
-    drawLine(opts.baseline.steps, opts.baseline.train_loss, "line-baseline");
-    drawLine(opts.variant.steps, opts.variant.train_loss, "line-variant");
-    drawLine(opts.baseline.eval_steps, opts.baseline.val_loss, "line-baseline-val");
-    drawLine(opts.variant.eval_steps, opts.variant.val_loss, "line-variant-val");
-
-    g.selectAll(".dot-baseline")
-      .data(opts.baseline.val_loss)
-      .enter()
-      .append("circle")
-      .attr("class", "dot-baseline")
-      .attr("cx", (d, i) => x(opts.baseline.eval_steps[i]))
-      .attr("cy", (d) => y(d))
-      .attr("r", 0)
-      .transition()
-      .delay(700)
-      .duration(250)
-      .attr("r", 2.6);
-
-    g.selectAll(".dot-variant")
-      .data(opts.variant.val_loss)
-      .enter()
-      .append("circle")
-      .attr("class", "dot-variant")
-      .attr("cx", (d, i) => x(opts.variant.eval_steps[i]))
-      .attr("cy", (d) => y(d))
-      .attr("r", 0)
-      .transition()
-      .delay(700)
-      .duration(250)
-      .attr("r", 3);
-  }
-
-  /** opts: { baselineLabel, variantLabel, baselineCounts, variantCounts }
-   * -- counts: [layer][expert] -> token count (final logged snapshot). */
-  function renderExpertBars(container, opts) {
-    container.innerHTML = "";
-    const nLayers = opts.baselineCounts.length;
-    const nExperts = opts.baselineCounts[0].length;
-    const width = Math.max(560, container.clientWidth || 560);
-    const layerH = 92;
-    const barAreaH = 50;
-    const height = nLayers * layerH + 12;
-
-    const legend = d3.select(container).insert("div", null).attr("class", "chart-legend");
-    legend.html(
-      `<span><span class="sw" style="background:#94a3b8"></span>Baseline (${opts.baselineLabel})</span>` +
-        `<span><span class="sw" style="background:#7c3aed"></span>${opts.variantLabel}</span>`
-    );
-
-    const svg = d3.select(container).append("svg").attr("width", width).attr("height", height);
-    const maxCount = d3.max([...opts.baselineCounts.flat(), ...opts.variantCounts.flat()]) || 1;
-    const groupW = (width - 40) / nExperts;
-    const y = d3.scaleLinear().domain([0, maxCount * 1.1]).range([0, barAreaH]);
-
-    for (let layer = 0; layer < nLayers; layer++) {
-      const g = svg.append("g").attr("transform", `translate(20,${layer * layerH + 20})`);
-      g.append("text").attr("class", "expert-group-label").attr("x", 0).attr("y", -6).text(`layer ${layer}`);
-      for (let expert = 0; expert < nExperts; expert++) {
-        const gx = expert * groupW;
-        const baseVal = opts.baselineCounts[layer][expert];
-        const varVal = opts.variantCounts[layer][expert];
-        const barW = Math.min(28, groupW / 2 - 6);
-
-        g.append("text")
-          .attr("class", "bar-label")
-          .attr("x", gx + barW)
-          .attr("y", barAreaH + 14)
-          .attr("text-anchor", "middle")
-          .text(`E${expert}`);
-
-        const b1 = g
-          .append("rect")
-          .attr("class", "bar-baseline")
-          .attr("x", gx)
-          .attr("width", barW)
-          .attr("y", barAreaH)
-          .attr("height", 0)
-          .attr("rx", 2);
-        b1.transition().duration(500).attr("y", barAreaH - y(baseVal)).attr("height", y(baseVal));
-
-        const b2 = g
-          .append("rect")
-          .attr("class", "bar-variant")
-          .attr("x", gx + barW + 4)
-          .attr("width", barW)
-          .attr("y", barAreaH)
-          .attr("height", 0)
-          .attr("rx", 2);
-        b2.transition().duration(500).delay(80).attr("y", barAreaH - y(varVal)).attr("height", y(varVal));
-      }
-    }
-  }
-
-  AB.charts = { renderMetricBars, renderLossCurve, renderExpertBars, fmt, fmtInt };
+  AB.charts = { renderCurves, renderExpertBars, renderBalanceDots, C, showTip, hideTip };
 })();

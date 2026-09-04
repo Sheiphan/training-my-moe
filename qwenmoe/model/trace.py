@@ -35,6 +35,17 @@ class LayerTrace:
     expert_outputs: dict[int, Tensor]  # expert_id -> (n_tokens_dispatched_to_it, d_model)
     moe_output: Tensor                 # (seq_len, d_model)
 
+    # QK-norm (moe-modernization Requirement 7.3). `q`/`k` above are always
+    # the vectors that actually reach the positional transform and the dot
+    # product -- i.e. already normalized when `qk_norm=True`. These two
+    # capture the *un*-normalized projections that QK-norm consumed, so a
+    # visualization can show both sides of the operation rather than only
+    # its result. `None` whenever QK-norm is off (nothing was normalized, so
+    # `q`/`k` already are the pre-norm values) and for MLA, which has no
+    # QK-norm path at all.
+    q_pre_norm: Tensor | None = None   # (n_heads, seq_len, head_dim)
+    k_pre_norm: Tensor | None = None   # (n_kv_heads, seq_len, head_dim)
+
 
 @dataclass
 class TraceBundle:

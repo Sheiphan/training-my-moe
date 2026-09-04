@@ -114,7 +114,59 @@
     return vec.map((v, i) => v * Math.cos(angles[i]) + (i < half ? -vec[i + half] : vec[i - half]) * Math.sin(angles[i]));
   }
 
+  function rms(vec) {
+    return Math.sqrt(vec.reduce((s, v) => s + v * v, 0) / vec.length);
+  }
+
+  /** What QK-norm actually did to THIS token, per head: the RMS of q
+   * before and after the norm. The pre-norm column drifts head to head
+   * (it inherits whatever scale the residual stream happens to have);
+   * the post-norm column is pinned to the learned gamma. Both columns are
+   * real captured tensors -- `q_pre_norm` is captured by
+   * `Attention.forward_with_trace` precisely so this comparison exists. */
+  function qkNormHTML() {
+    const t = TJ.store.target0();
+    if (!t.q_pre_norm) return "";
+    const pre = t.q_pre_norm.map(rms);
+    const post = t.q.map(rms);
+    const kPre = t.k_pre_norm.map(rms);
+    const kPost = t.k.map(rms);
+    const max = Math.max(...pre, ...post, ...kPre, ...kPost);
+
+    function row(label, before, after) {
+      return (
+        `<div class="qkn-row"><span class="qkn-label">${label}</span><div class="qkn-heads">` +
+        before
+          .map(
+            (b, h) =>
+              `<div class="qkn-head" title="head ${h}: RMS ${b.toFixed(3)} → ${after[h].toFixed(3)}">
+                 <div class="qkn-bars">
+                   <span class="qkn-bar pre" style="height:${Math.max(2, (b / max) * 34)}px"></span>
+                   <span class="qkn-bar post" style="height:${Math.max(2, (after[h] / max) * 34)}px"></span>
+                 </div>
+                 <span class="qkn-h">h${h}</span>
+               </div>`
+          )
+          .join("") +
+        `</div></div>`
+      );
+    }
+
+    const spread = (a) => Math.max(...a) - Math.min(...a);
+    return (
+      `<div class="real-label">Real per-head magnitude (RMS), before <span class="qkn-key pre"></span> and after <span class="qkn-key post"></span> QK-norm</div>` +
+      row("Query", pre, post) +
+      row("Key", kPre, kPost) +
+      `<div class="real-note">Before the norm, head magnitudes vary across a spread of ` +
+      `<b>${spread(pre).toFixed(3)}</b> (Q) and <b>${spread(kPre).toFixed(3)}</b> (K) — every head arrives at a ` +
+      `different scale. After it, all of them sit at the learned gamma, spread <b>${spread(post).toFixed(3)}</b> ` +
+      `and <b>${spread(kPost).toFixed(3)}</b>. Since the attention score is q·k, that drift would otherwise be ` +
+      `squared into the logits.</div>`
+    );
+  }
+
   const RENDERERS = {
+    qknorm: qkNormHTML,
     embed: () => vectorChipsHTML(TJ.store.data().target_embedding, { label: `Real embedding vector for '${chLabel(TJ.store.data().target_token)}' (first 8 of ${TJ.store.cfg().d_model} dims)` }),
     qkv: () => {
       const cfg = TJ.store.cfg();

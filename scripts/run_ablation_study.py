@@ -40,6 +40,9 @@ from configs.presets import (
     ACT_GEGLU,
     ACT_GELU,
     ATT_QKNORM,
+    BASELINE,
+    BASELINE_V2,
+    FINEGRAINED,
     MOE_FINEGRAINED,
     MOE_LOSSFREE,
     MTP_D1,
@@ -51,8 +54,10 @@ from configs.presets import (
 from qwenmoe.config import DataConfig, ModelConfig, TrainConfig
 from qwenmoe.model.moe import LossFreeBalancer, select_top_k
 from qwenmoe.model.transformer import QwenMoEModel
+from qwenmoe.tokenizer.base import build_tokenizer_from_meta
 from qwenmoe.train.compare import run_comparison
 from qwenmoe.train.scaling import chinchilla_budget, count_params, moe_budget_note
+from qwenmoe.train.trainer import load_checkpoint
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -89,6 +94,196 @@ VARIANTS: dict[str, tuple[str, str, ModelConfig, dict]] = {
 }
 
 
+# Per-axis framing for `ablation_study/`'s explainer cards: what question
+# the axis asks, and where the idea comes from. Prose only -- every NUMBER
+# the page shows still comes from a real `train.jsonl` below. `paper` is the
+# arXiv id of the work the option is taken from.
+AXES: dict[str, dict] = {
+    "baseline": {
+        "label": "Baseline",
+        "question": "What does the unmodified SMOKE_TEST config do?",
+        "why": "Every other row on this page changes exactly one thing relative to this run, on the identical token slice and step budget.",
+    },
+    "positional": {
+        "label": "Positional encoding",
+        "question": "How should the model know what order the tokens came in?",
+        "why": "Attention is a set operation -- without positional information, 'dog bites man' and 'man bites dog' are the same input. RoPE rotates q/k by a position-dependent angle; NoPE supplies nothing and leans entirely on the causal mask; ALiBi adds a fixed distance penalty to the scores.",
+        "paper": "2104.09864",
+    },
+    "activation": {
+        "label": "Expert activation",
+        "question": "What nonlinearity should each expert's feed-forward network use?",
+        "why": "SwiGLU and GEGLU are gated: one branch decides how much of the other branch to let through, which costs a third weight matrix. Plain GELU has no gate and only two matrices.",
+        "paper": "2002.05202",
+    },
+    "moe_balancing": {
+        "label": "MoE load balancing",
+        "question": "How do you stop the router sending every token to the same favourite expert?",
+        "why": "Aux-loss balancing adds a gradient penalty for imbalance. Loss-free balancing instead nudges a per-expert selection bias up or down each step, keeping load even with no extra loss term to trade off against the language-modelling objective.",
+        "paper": "2408.15664",
+    },
+    "attention": {
+        "label": "Attention variant",
+        "question": "How much has to be cached per token during generation?",
+        "why": "GQA shrinks the cache by sharing each key/value head across several query heads. MLA compresses key and value into a single small latent that is the only thing cached, then decompresses it on the fly.",
+        "paper": "2405.04434",
+    },
+    "tie_word_embeddings": {
+        "label": "Tied embeddings",
+        "question": "Should the output layer reuse the input embedding matrix?",
+        "why": "Tying makes the LM head literally the embedding table transposed, saving vocab_size x d_model parameters. Untying gives the output its own matrix, which costs those parameters but lets input and output representations diverge.",
+        "paper": "1608.05859",
+    },
+    "router_scoring": {
+        "label": "Router scoring",
+        "question": "Should expert scores compete against each other, or be judged independently?",
+        "why": "Softmax shares one denominator across experts, so raising one expert's score necessarily lowers every other's. Sigmoid scores each expert on its own merits and only renormalizes across the selected top-k, which produces flatter gate weights and higher routing entropy.",
+        "paper": "2412.19437",
+    },
+    "qk_norm": {
+        "label": "QK-norm",
+        "question": "What stops attention logits from growing without bound as the model gets deeper?",
+        "why": "The residual stream grows layer over layer, so q and k grow with it and the dot products that feed softmax grow quadratically -- pushing softmax toward a one-hot spike. A per-head RMSNorm on q and k before RoPE pins their scale, so the logit range stays bounded regardless of depth.",
+        "paper": "2505.09388",
+    },
+    "mtp_depth": {
+        "label": "Multi-token prediction",
+        "question": "Does predicting more than one future token sharpen the representation?",
+        "why": "An extra head predicts the token two positions ahead, and its loss is averaged in. The main head's prediction is unchanged at inference; the claim is that the auxiliary signal forces a representation that plans further ahead.",
+        "paper": "2404.19737",
+    },
+    "expert_granularity": {
+        "label": "Expert granularity",
+        "question": "Is it better to have a few wide experts or many narrow ones?",
+        "why": "DeepSeekMoE splits each expert's hidden width and raises top_k proportionally, holding both total and per-token-active FFN parameters constant. More, narrower experts mean far more possible expert combinations per token, so routing can specialize more finely.",
+        "paper": "2401.06066",
+    },
+    "optimizer": {
+        "label": "Optimizer",
+        "question": "Is AdamW the right update rule for a matrix-shaped parameter?",
+        "why": "Muon orthogonalizes each 2-D parameter's momentum with a Newton-Schulz iteration before applying it, treating a weight matrix as a matrix rather than as a bag of independent scalars. Non-matrix parameters fall back to AdamW.",
+    },
+    "lr_schedule": {
+        "label": "LR schedule",
+        "question": "Do you have to know the total token budget before you start training?",
+        "why": "Cosine decay bakes the end of training into its shape, so stopping early leaves the LR mid-decay. Warmup-Stable-Decay holds a constant LR for most of the run and only decays over the final fraction, so the run can be extended or cut without reshaping what already happened.",
+        "paper": "2404.06395",
+    },
+}
+
+
+def _params_for(config: ModelConfig) -> dict:
+    """Real measured parameter counts for one variant's exact config."""
+    breakdown = count_params(QwenMoEModel(config))
+    return {"total": breakdown.total, "active": breakdown.active}
+
+
+def _preset_tier(run_dir: Path, seeds: tuple[int, ...]) -> dict | None:
+    """The modernized-preset head-to-head from journal entry 035, read off
+    the real multi-seed run `notebooks/07_modernized_presets.ipynb` wrote to
+    `runs/modernized_presets/`.
+
+    Separate from the single-axis study above in every way that matters --
+    different base config (BASELINE, not SMOKE_TEST), different corpus
+    slice, multiple seeds, and variants that deliberately change *several*
+    axes at once -- so it ships as its own section of the export rather than
+    being mixed into `variants`. Returns `None` when that run isn't on disk,
+    so this script still works on a fresh clone.
+    """
+    results_path = run_dir / "results.json"
+    if not results_path.exists():
+        logger.info("no %s -- skipping the modernized-preset tier", results_path)
+        return None
+
+    summary = json.loads(results_path.read_text())
+    presets = {"BASELINE": BASELINE, "BASELINE_V2": BASELINE_V2, "FINEGRAINED": FINEGRAINED}
+    vocab_size = summary["config"]["vocab_size"]
+
+    variants_out = {}
+    for name, cfg in presets.items():
+        if name not in summary["variants"]:
+            continue
+        entry = dict(summary["variants"][name])
+        curves = []
+        for seed in seeds:
+            log_path = run_dir / name / f"seed_{seed}" / "logs" / "train.jsonl"
+            if log_path.exists():
+                curves.append(_read_log(log_path)["curve"])
+        entry["config"] = dataclasses.asdict(dataclasses.replace(cfg, vocab_size=vocab_size))
+        entry["curves"] = curves
+        variants_out[name] = entry
+
+    return {
+        "baseline": "BASELINE",
+        "seeds": list(seeds),
+        "config": summary["config"],
+        "variants": variants_out,
+    }
+
+
+def _modern_probe(run_dir: Path, prompt: str = "ROMEO:\nWhat is the cause of this?\n") -> dict | None:
+    """One real forward pass through each trained modernized checkpoint,
+    reduced to the two measurements that show what `BASELINE_V2` changed.
+
+    Both are per layer, so the *shape across depth* is visible -- which is
+    the whole claim in each case:
+
+    - `attn_logit_std`: spread of the pre-mask attention logits. Without
+      QK-norm this tracks the residual stream and grows with depth; with it
+      the scale is pinned regardless of layer.
+    - `router_entropy_norm` / `softmax_vs_sigmoid`: how flat the routing
+      distribution is. The comparison evaluates BOTH scoring rules on the
+      SAME real router logits, so the difference between the columns is
+      purely the scoring function, not a different model.
+
+    Returns `None` when the modernized run isn't on disk.
+    """
+    import math as _math
+
+    out: dict[str, dict] = {}
+    for name in ("BASELINE", "BASELINE_V2", "FINEGRAINED"):
+        ckpt_path = run_dir / name / "seed_1337" / "checkpoints" / "step_305.pt"
+        if not ckpt_path.exists():
+            continue
+        checkpoint = load_checkpoint(str(ckpt_path))
+        cfg = checkpoint["model_config"]
+        model = QwenMoEModel(cfg)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        tokenizer = build_tokenizer_from_meta(checkpoint["tokenizer_meta"])
+        ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long)
+        with torch.no_grad():
+            _, bundle = model.forward_with_trace(ids)
+
+        logit_std, entropy, softmax_p, sigmoid_p = [], [], [], []
+        for layer in bundle.layers:
+            logit_std.append(round(float(layer.attn_scores_pre_mask.std()), 4))
+            mean_probs = layer.router_probs.mean(dim=0)
+            h = float(-(mean_probs * (mean_probs + 1e-12).log()).sum())
+            entropy.append(round(h / _math.log(cfg.n_routed_experts), 4))
+            # Both rules on the same real logits, for the final token.
+            logits = layer.router_logits[-1]
+            sm = torch.softmax(logits, dim=-1)
+            aff = torch.sigmoid(logits)
+            sg = aff / aff.sum()
+            softmax_p.append([round(v, 4) for v in sm.tolist()])
+            sigmoid_p.append([round(v, 4) for v in sg.tolist()])
+
+        out[name] = {
+            "attn_logit_std": logit_std,
+            "router_entropy_norm": entropy,
+            "softmax_probs_layer0": softmax_p[0],
+            "sigmoid_probs_layer0": sigmoid_p[0],
+            "qk_norm": cfg.qk_norm,
+            "router_scoring": cfg.router_scoring,
+            "n_routed_experts": cfg.n_routed_experts,
+            "top_k": cfg.top_k,
+        }
+    if not out:
+        return None
+    return {"prompt": prompt, "models": out}
+
+
 def _read_log(log_path: Path) -> dict:
     """Parses a `Trainer`-written `train.jsonl` -- same record schema
     `qwenmoe/viz/scenes_training.py::load_training_log` reads, reimplemented
@@ -101,6 +296,7 @@ def _read_log(log_path: Path) -> dict:
     in-memory `VariantResult` (or a live model) at all.
     """
     steps, train_loss, aux_loss, elapsed_s = [], [], [], []
+    lr, mtp_loss = [], []
     eval_steps, val_loss, val_ppl = [], [], []
     expert_steps, expert_counts = [], []
     with log_path.open(encoding="utf-8") as f:
@@ -113,6 +309,8 @@ def _read_log(log_path: Path) -> dict:
                 steps.append(record["step"])
                 train_loss.append(record["train_loss"])
                 aux_loss.append(record.get("aux_loss"))
+                lr.append(record.get("lr"))
+                mtp_loss.append(record.get("mtp_loss"))
                 elapsed_s.append(record["elapsed_s"])
                 counts = record.get("expert_token_counts")
                 if counts is not None:
@@ -137,6 +335,8 @@ def _read_log(log_path: Path) -> dict:
             "steps": steps,
             "train_loss": train_loss,
             "aux_loss": aux_loss,
+            "lr": lr,
+            "mtp_loss": mtp_loss,
             "eval_steps": eval_steps,
             "val_loss": val_loss,
             "val_perplexity": val_ppl,
@@ -271,10 +471,14 @@ def main() -> None:
             "label": label,
             "config": dataclasses.asdict(configs_by_name[name]),
             "train_overrides": train_ov,
+            "params": _params_for(configs_by_name[name]),
             **parsed,
         }
 
     data = {
+        "axes": AXES,
+        "presets": _preset_tier(Path("runs/modernized_presets"), (1337, 2024)),
+        "modern_probe": _modern_probe(Path("runs/modernized_presets")),
         "baseline": BASELINE_NAME,
         "data_config": {
             "corpus": data_config.corpus,

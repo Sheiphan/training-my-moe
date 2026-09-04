@@ -121,6 +121,24 @@
     }
     y += 46 + 14;
 
+    // QK-norm sits between the projection and the positional transform,
+    // and only appears at all when the checkpoint has it -- so the diagram
+    // itself differs between BASELINE and BASELINE_V2.
+    if (cfg.qk_norm) {
+      parts.push(
+        box(
+          INNER_X,
+          y,
+          INNER_W,
+          40,
+          ["QK-norm \u2014 per-head RMSNorm on Q and K", `independent \u03b3 per head, ${headDim} dims each \u00b7 bounds the logit scale (Qwen3)`],
+          "norm",
+          { focus: "attn-qknorm1", title: "ModelConfig.qk_norm = True \u2014 applied before the positional transform", size: 12 }
+        )
+      );
+      y += 40 + 14;
+    }
+
     const posLabel = {
       rope: ["RoPE \u2014 rotates Q,K by \u03b8(pos) right here", `inv_freq_i = 1/${cfg.rope_theta}^(2i/${headDim})  (Su et al., 2021)`],
       nope: ["NoPE \u2014 no positional operation applied", "token order carried only by the causal mask"],
@@ -250,7 +268,7 @@
 
   function buildMoE(y, cfg, parts) {
     parts.push(
-      box(INNER_X, y, INNER_W, 40, ["Router \u2014 Linear (no bias)", `${cfg.d_model} \u2192 ${cfg.n_routed_experts} logits \u2192 softmax \u2192 router_probs`], "router-note", {
+      box(INNER_X, y, INNER_W, 40, ["Router \u2014 Linear (no bias)", `${cfg.d_model} \u2192 ${cfg.n_routed_experts} logits \u2192 ${cfg.router_scoring === "sigmoid" ? "sigmoid per expert \u2192 renormalize" : "softmax"} \u2192 router_probs`], "router-note", {
         focus: "moe-router1",
         title: "Router.gate",
       })

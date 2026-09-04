@@ -446,11 +446,8 @@
       const W = TJ.store.weights();
       const target0 = TJ.store.target0();
       const logits = L0.router_logits[T.target_position];
-      const maximum = Math.max(...logits);
-      const exponentials = logits.map((value) => Math.exp(value - maximum));
-      const denominator = exponentials.reduce((sum, value) => sum + value, 0);
       const projectionSection = document.createElement("div");
-      const softmaxSection = document.createElement("div");
+      const scoringSection = document.createElement("div");
       renderMatMul(projectionSection, {
         formula: String.raw`\text{router\_logits}=\text{RMSNorm}(x)W_{router}`,
         aLabel: "RMSNorm(x)", a: W.moe_norm_output_target,
@@ -458,16 +455,75 @@
         outLabel: "logits", colLabels: Array.from({ length: cfg.n_routed_experts }, (_, index) => `E${index}`),
         colWindow: cfg.n_routed_experts,
       });
-      renderElementwise(softmaxSection, {
-        title: String.raw`p_i=\dfrac{e^{z_i-\max(z)}}{\sum_j e^{z_j-\max(z)}}`,
-        steps: [
-          { label: "router logits z", values: logits },
-          { label: "exp(z - max)", values: exponentials },
-          { label: `divide by ${denominator.toFixed(3)}`, values: target0.router_probs },
-        ],
-        take: cfg.n_routed_experts,
-      });
-      container.replaceChildren(projectionSection, softmaxSection);
+
+      // The scoring rule this checkpoint actually trained with -- the two
+      // branches are genuinely different arithmetic, so showing softmax's
+      // steps for a sigmoid model would be showing a calculation the model
+      // never performed.
+      if (cfg.router_scoring === "sigmoid") {
+        const affinities = logits.map((z) => 1 / (1 + Math.exp(-z)));
+        const denominator = affinities.reduce((sum, value) => sum + value, 0);
+        renderElementwise(scoringSection, {
+          title: String.raw`s_i=\sigma(z_i)=\dfrac{1}{1+e^{-z_i}},\qquad p_i=\dfrac{s_i}{\sum_j s_j}`,
+          steps: [
+            { label: "router logits z", values: logits },
+            { label: "sigmoid(z) — each expert scored alone", values: affinities },
+            { label: `divide by ${denominator.toFixed(3)}`, values: target0.router_probs },
+          ],
+          take: cfg.n_routed_experts,
+        });
+      } else {
+        const maximum = Math.max(...logits);
+        const exponentials = logits.map((value) => Math.exp(value - maximum));
+        const denominator = exponentials.reduce((sum, value) => sum + value, 0);
+        renderElementwise(scoringSection, {
+          title: String.raw`p_i=\dfrac{e^{z_i-\max(z)}}{\sum_j e^{z_j-\max(z)}}`,
+          steps: [
+            { label: "router logits z", values: logits },
+            { label: "exp(z - max)", values: exponentials },
+            { label: `divide by ${denominator.toFixed(3)}`, values: target0.router_probs },
+          ],
+          take: cfg.n_routed_experts,
+        });
+      }
+      container.replaceChildren(projectionSection, scoringSection);
+
+      // Both rules evaluated on the SAME real logits, so the difference on
+      // screen is purely the scoring function. Exported by
+      // scripts/export_trace.py::_routing_compare.
+      const cmp = (T.routing_compare || [])[0];
+      if (cmp) {
+        const wrap = document.createElement("div");
+        const max = Math.max(...cmp.softmax_probs, ...cmp.sigmoid_probs);
+        const chosen = new Set(cmp.topk_indices);
+        const rowsFor = (values, color) =>
+          values
+            .map(
+              (v, i) =>
+                `<div class="rc-row${chosen.has(i) ? " chosen" : ""}">
+                   <span class="rc-e">E${i}</span>
+                   <span class="rc-track"><span class="rc-fill" style="width:${(v / max) * 100}%;background:${color}"></span></span>
+                   <span class="rc-v">${v.toFixed(4)}</span>
+                 </div>`
+            )
+            .join("");
+        const ent = (p) => -p.reduce((s, v) => s + (v > 0 ? v * Math.log(v) : 0), 0) / Math.log(p.length);
+        wrap.innerHTML =
+          `<div class="rc-title">The same real logits, scored both ways</div>
+           <div class="rc-cols">
+             <div><div class="rc-h">softmax — shared denominator</div>${rowsFor(cmp.softmax_probs, "#94a3b8")}
+               <div class="rc-stat">peak ${Math.max(...cmp.softmax_probs).toFixed(4)} · entropy ${ent(cmp.softmax_probs).toFixed(4)}</div></div>
+             <div><div class="rc-h">sigmoid — scored independently</div>${rowsFor(cmp.sigmoid_probs, "#a78bfa")}
+               <div class="rc-stat">peak ${Math.max(...cmp.sigmoid_probs).toFixed(4)} · entropy ${ent(cmp.sigmoid_probs).toFixed(4)}</div></div>
+           </div>`;
+        container.appendChild(wrap);
+        noteEl(
+          container,
+          `This model uses ${cmp.used}. Highlighted experts are the ones actually selected. Sigmoid spreads ` +
+            `the same logits into a flatter distribution — higher entropy means more experts keep a meaningful ` +
+            `share, which is what keeps gradient flowing to more than one or two of them.`
+        );
+      }
     },
 
     "moe-topk"(container) {

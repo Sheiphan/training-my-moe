@@ -199,7 +199,12 @@ class Attention(nn.Module):
         k = self.w_k(x).view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.w_v(x).view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
+        # Captured only when QK-norm is active: with it off, `q`/`k` below
+        # are already the un-normalized projections, so a second copy would
+        # be pure duplication (and `LayerTrace` documents the `None`).
+        trace_q_pre, trace_k_pre = None, None
         if self.qk_norm:
+            trace_q_pre, trace_k_pre = q.squeeze(0), k.squeeze(0)
             q = self.q_norm(q)
             k = self.k_norm(k)
         trace_q, trace_k, trace_v = q.squeeze(0), k.squeeze(0), v.squeeze(0)
@@ -237,6 +242,8 @@ class Attention(nn.Module):
             "v": trace_v,
             "attn_scores_pre_mask": trace_scores_pre_mask,
             "attn_scores_post_softmax": trace_scores_post_softmax,
+            "q_pre_norm": trace_q_pre,
+            "k_pre_norm": trace_k_pre,
         }
         return output, trace
 

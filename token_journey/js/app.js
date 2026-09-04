@@ -10,34 +10,130 @@
     index: 0,
     playing: false,
     timer: null,
-    attention: "gqa",
-    positional: "rope",
     steps: null,
+    switching: false,
   };
 
-  function variantKey() {
-    return state.attention === "mla" ? "mla_rope" : `gqa_${state.positional}`;
+  const FAMILIES = [
+    {
+      key: "classic",
+      title: "Original architecture — one axis at a time",
+      note:
+        "Four real SMOKE_TEST-sized checkpoints (d_model 64, 2 layers) from the ablation study, covering every " +
+        "attention × positional pairing that has real trained weights. MLA always applies its own decoupled " +
+        "RoPE, so MLA × NoPE/ALiBi do not exist as distinct variants.",
+    },
+    {
+      key: "modern",
+      title: "Modernized presets — what the spec changed",
+      note:
+        "The three full-size presets (d_model 256, 6 layers) trained head to head in journal entry 035. " +
+        "BASELINE is the control; BASELINE_V2 adds QK-norm, sigmoid routing and width-aware init; FINEGRAINED " +
+        "further segments the experts. Switching between them changes the walkthrough itself, not just the numbers.",
+    },
+  ];
+
+  function buildPicker() {
+    const M = TJ.store.manifest;
+    const host = document.getElementById("variant-picker");
+    host.innerHTML = FAMILIES.map((fam) => {
+      const cards = Object.entries(M.variants)
+        .filter(([, m]) => m.family === fam.key)
+        .map(([key, m]) => {
+          const c = m.config;
+          const bits = [
+            `${c.n_routed_experts}&times;E / top-${c.top_k}`,
+            c.qk_norm ? "QK-norm" : null,
+            c.router_scoring === "sigmoid" ? "sigmoid routing" : null,
+            c.attention_variant === "mla" ? "MLA" : null,
+            c.positional_scheme !== "rope" ? c.positional_scheme.toUpperCase() : null,
+          ].filter(Boolean);
+          return `<button class="variant-card" data-variant="${key}" aria-pressed="false">
+              <span class="vc-name">${m.label}</span>
+              <span class="vc-blurb">${m.blurb}</span>
+              <span class="vc-tags">${bits.map((b) => `<span class="vc-tag">${b}</span>`).join("")}</span>
+              <span class="vc-size">${m.size_kb >= 1024 ? (m.size_kb / 1024).toFixed(1) + " MB" : Math.round(m.size_kb) + " KB"} trace</span>
+            </button>`;
+        })
+        .join("");
+      if (!cards) return "";
+      return `<section class="variant-family">
+          <h3>${fam.title}</h3>
+          <p class="vf-note">${fam.note}</p>
+          <div class="variant-cards">${cards}</div>
+        </section>`;
+    }).join("");
+
+    host.querySelectorAll("[data-variant]").forEach((btn) =>
+      btn.addEventListener("click", () => switchVariant(btn.dataset.variant))
+    );
   }
 
   function updateVariantButtons() {
-    document.querySelectorAll("#controls .ctrl-group").forEach((group) => {
-      const key = group.dataset.key;
-      group.querySelectorAll("button").forEach((btn) => {
-        btn.classList.toggle("active", btn.dataset.value === state[key]);
-      });
+    const current = TJ.store.key();
+    document.querySelectorAll("#variant-picker [data-variant]").forEach((btn) => {
+      const on = btn.dataset.variant === current;
+      btn.classList.toggle("active", on);
+      btn.setAttribute("aria-pressed", String(on));
     });
   }
 
-  function switchVariant(key) {
+  /** A compact, always-visible readout of the architecture being walked. */
+  function renderArchSummary() {
+    const c = TJ.store.cfg();
+    const m = TJ.store.meta();
+    const rows = [
+      ["shape", `d_model ${c.d_model} &middot; ${c.n_layers} layers &middot; ${c.n_heads}Q/${c.n_kv_heads}KV heads`],
+      ["attention", c.attention_variant.toUpperCase() + (c.qk_norm ? " + QK-norm" : "")],
+      ["position", c.positional_scheme.toUpperCase()],
+      ["experts", `${c.n_routed_experts} routed &times; d_ff ${c.d_ff}, top-${c.top_k} &middot; ${c.n_shared_experts} shared`],
+      ["routing", `${c.router_scoring} &middot; ${c.moe_balancing.replace("_", "-")}`],
+      ["init_std", String(c.init_std)],
+    ];
+    document.getElementById("arch-summary").innerHTML =
+      `<div class="as-title">${m.label}</div>` +
+      rows
+        .map(([k, v]) => `<div class="as-item"><span class="as-k">${k}</span><span class="as-v">${v}</span></div>`)
+        .join("");
+    document.getElementById("variant-note").innerHTML =
+      `Trace captured from <code>${m.checkpoint}</code>` +
+      (m.has_expert_weights
+        ? ". The expert matrix-multiplication deep-dive is available for this variant."
+        : ". This variant ships activations but not its per-expert weight matrices (they would add tens of MB " +
+          "to explain a step the smaller variants already cover), so the expert matmul deep-dive is not shown for it.");
+  }
+
+  function setLoading(on, text) {
+    const veil = document.getElementById("diagram-loading");
+    if (text) document.getElementById("loading-text").textContent = text;
+    veil.hidden = !on;
+  }
+
+  async function switchVariant(key) {
+    if (state.switching || key === TJ.store.key()) return;
     stopAutoplay();
-    TJ.store.set(key);
+    state.switching = true;
+    const meta = TJ.store.meta(key);
+    if (!TJ.store.isLoaded(key)) {
+      setLoading(true, `Loading ${meta.label} trace (${Math.round(meta.size_kb)} KB)…`);
+    }
+    try {
+      await TJ.store.set(key);
+    } catch (err) {
+      setLoading(true, `Could not load ${meta.label}: ${err.message}`);
+      state.switching = false;
+      return;
+    }
+    setLoading(false);
     const data = TJ.store.data();
     state.steps = TJ.buildSteps(data);
     TJ.diagram.mount("#diagram", data);
     TJ.camera.init("#diagram");
     updateVariantButtons();
+    renderArchSummary();
     buildRail();
     goToStep(Math.min(state.index, state.steps.length - 1));
+    state.switching = false;
   }
 
   function chapterGroups() {
@@ -74,6 +170,18 @@
     });
   }
 
+  // Deep-dives that re-run a real matmul through the expert FFNs, and so
+  // need `weights.experts` -- which the large modern variants deliberately
+  // do not ship (see scripts/export_trace.py). Gating here rather than
+  // inside each dive keeps the requirement in one visible place.
+  const NEEDS_EXPERT_WEIGHTS = new Set(["moe-experts", "moe-combine"]);
+
+  function hasDeepDive(step) {
+    if (!TJ.deepDive[step.id]) return false;
+    if (NEEDS_EXPERT_WEIGHTS.has(step.id) && !TJ.store.weights().has_expert_weights) return false;
+    return true;
+  }
+
   function renderNarrative(step) {
     const card = document.querySelector(".narrative-card");
     card.classList.remove("step-enter");
@@ -105,7 +213,7 @@
     panel.style.display = "none";
     panel.innerHTML = "";
     btn.setAttribute("aria-expanded", "false");
-    if (TJ.deepDive[step.id]) {
+    if (hasDeepDive(step)) {
       btn.style.display = "";
       panel.style.display = "";
       TJ.deepDive[step.id](panel);
@@ -209,22 +317,6 @@
       }
     });
 
-    document.querySelectorAll("#controls .ctrl-group").forEach((group) => {
-      const key = group.dataset.key;
-      group.querySelectorAll("button").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          if (key === "attention") {
-            state.attention = btn.dataset.value;
-            state.positional = "rope";
-          } else {
-            state.positional = btn.dataset.value;
-            state.attention = "gqa";
-          }
-          switchVariant(variantKey());
-        });
-      });
-    });
-
     window.addEventListener("keydown", (e) => {
       if (e.target.closest("button, a, input, select, textarea") || e.target.isContentEditable) return;
       if (e.key === "ArrowRight" || e.key === " ") {
@@ -239,14 +331,33 @@
     });
   }
 
-  function init() {
+  /** `?variant=<key>` lets architecture.html hand a configuration straight
+   * to this page, so building a shape on the schematic and then walking a
+   * real token through it is one click rather than a re-selection. */
+  function requestedVariant() {
+    const wanted = new URLSearchParams(window.location.search).get("variant");
+    return wanted && TJ.store.manifest.variants[wanted] ? wanted : null;
+  }
+
+  async function init() {
+    buildPicker();
+    wireControls();
+    const first = requestedVariant() || TJ.store.key();
+    setLoading(true, `Loading ${TJ.store.meta(first).label} trace…`);
+    try {
+      await TJ.store.set(first);
+    } catch (err) {
+      setLoading(true, `Could not load the default trace: ${err.message}`);
+      return;
+    }
+    setLoading(false);
     const data = TJ.store.data();
     state.steps = TJ.buildSteps(data);
     TJ.diagram.mount("#diagram", data);
     TJ.camera.init("#diagram");
-    buildRail();
-    wireControls();
     updateVariantButtons();
+    renderArchSummary();
+    buildRail();
     goToStep(0);
   }
 

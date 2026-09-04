@@ -15,6 +15,13 @@
   "use strict";
   const TJ = (window.TJ = window.TJ || {});
 
+  /** "n choose k", formatted with thousands separators. */
+  function combinations(n, k) {
+    let r = 1;
+    for (let i = 0; i < k; i++) r = (r * (n - i)) / (i + 1);
+    return Math.round(r).toLocaleString();
+  }
+
   function _attentionSteps(cfg) {
     if (cfg.attention_variant === "mla") {
       const headDim = cfg.d_model / cfg.n_heads;
@@ -85,6 +92,25 @@
       },
     }[cfg.positional_scheme];
 
+    // QK-norm (moe-modernization Requirement 7.3) sits between the QKV
+    // projection and the positional transform, and only exists as a step
+    // when the checkpoint actually has it -- so BASELINE and BASELINE_V2
+    // differ by a visible extra stop on the walkthrough, not just by a
+    // number.
+    const qkNormStep = cfg.qk_norm
+      ? [
+          {
+            id: "attn-qknorm",
+            title: "QK-norm: pin the Query/Key scale",
+            focus: "attn-qknorm1",
+            narrative: `Before position is applied, Query and Key are each passed through their own RMSNorm, separately for every head. Why: the residual stream grows as the network gets deeper, so q and k grow with it, and the attention score is a dot product of the two — meaning the scores grow roughly with the SQUARE of that drift. Left alone, deep layers push softmax toward a one-hot spike, and a saturated softmax has almost no gradient left to learn from. Normalizing q and k first pins their length no matter how deep we are, so the scores stay in a range softmax can actually work with.`,
+            formula:
+              "q \\leftarrow \\dfrac{q}{\\sqrt{\\frac{1}{d_h}\\sum_i q_i^2+\\epsilon}}\\odot\\gamma_q, \\qquad k \\leftarrow \\dfrac{k}{\\sqrt{\\frac{1}{d_h}\\sum_i k_i^2+\\epsilon}}\\odot\\gamma_k",
+            real: "qknorm",
+          },
+        ]
+      : [];
+
     return [
       {
         id: "attn-qkv",
@@ -94,6 +120,7 @@
         formula: "Q = xW_Q,\\qquad K = xW_K,\\qquad V = xW_V",
         real: "qkv",
       },
+      ...qkNormStep,
       { id: "attn-rope", focus: "attn-rope1", ...positionalStep },
       {
         id: "attn-group",
@@ -182,10 +209,16 @@
       {
         id: "moe-router",
         chapter: "Mixture of Experts \u00b7 Block 1",
-        title: "Router \u2192 softmax",
+        title: cfg.router_scoring === "sigmoid" ? "Router \u2192 sigmoid affinities" : "Router \u2192 softmax",
         focus: ["moe-router1", "moe-balance1"],
-        narrative: `Instead of running every token through one giant feed-forward network, this model has ${cfg.n_routed_experts} smaller "expert" networks and a router that decides which ones each token should use. The router is just one more learned linear layer producing a score per expert, turned into a probability distribution by softmax.`,
-        formula: "p = \\text{softmax}(xW_{router}) \\in \\mathbb{R}^{n_{experts}}",
+        narrative:
+          cfg.router_scoring === "sigmoid"
+            ? `Instead of running every token through one giant feed-forward network, this model has ${cfg.n_routed_experts} smaller "expert" networks and a router that decides which ones each token should use. The router is one more learned linear layer producing a score per expert — but unlike the original design, each score is turned into an affinity INDEPENDENTLY with a sigmoid, then the whole vector is renormalized. That independence is the point: with a softmax all experts share one denominator, so raising one expert's score necessarily pushes every other one down and a single expert can run away with the token. A sigmoid asks each expert "how well do you match this token?" on its own terms, which leaves the gate weights flatter and keeps more than one expert receiving real gradient.`
+            : `Instead of running every token through one giant feed-forward network, this model has ${cfg.n_routed_experts} smaller "expert" networks and a router that decides which ones each token should use. The router is just one more learned linear layer producing a score per expert, turned into a probability distribution by softmax — one shared denominator, so the experts compete directly against each other.`,
+        formula:
+          cfg.router_scoring === "sigmoid"
+            ? "s_i = \\sigma(xW_{router})_i,\\qquad p_i = s_i \\big/ \\textstyle\\sum_j s_j"
+            : "p = \\text{softmax}(xW_{router}) \\in \\mathbb{R}^{n_{experts}}",
         real: "router",
       },
       {
@@ -193,7 +226,11 @@
         chapter: "Mixture of Experts \u00b7 Block 1",
         title: "Top-k selection",
         focus: "moe-topk1",
-        narrative: `Only the top ${cfg.top_k} highest-scoring experts are actually used for this token -- the rest are skipped entirely (no compute spent on them at all). The chosen experts' weights are renormalized so they sum to 1, then used to weight each expert's contribution.`,
+        narrative:
+          `Only the top ${cfg.top_k} highest-scoring experts are actually used for this token -- the rest are skipped entirely (no compute spent on them at all). The chosen experts' weights are renormalized so they sum to 1, then used to weight each expert's contribution.` +
+          (cfg.n_routed_experts >= 16
+            ? ` This model uses DeepSeekMoE fine-grained experts: ${cfg.n_routed_experts} narrow experts of width ${cfg.d_ff} instead of a handful of wide ones, picking ${cfg.top_k} of them. Both the total expert width and the width each token activates are unchanged versus the coarse version -- what changes is that there are now ${combinations(cfg.n_routed_experts, cfg.top_k)} distinct ways to combine experts, so routing can specialize far more finely for the same compute.`
+            : ""),
         formula: "\\text{top-}k(p),\\qquad \\hat p_i = p_i \\big/ \\textstyle\\sum_{j\\,\\in\\,\\text{top-}k} p_j",
         real: "topk",
       },
