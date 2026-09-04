@@ -5,6 +5,7 @@ tokenizer — `scripts/train.py`/`scripts/run_comparison.py` override it with
 the actual trained tokenizer's `vocab_size` before constructing a model.
 """
 import dataclasses
+import math
 
 from qwenmoe.config import ModelConfig
 
@@ -72,5 +73,55 @@ MTP_D1 = dataclasses.replace(SMOKE_TEST, mtp_depth=1)
 # the "exactly one axis" preset check.
 MOE_FINEGRAINED = dataclasses.replace(
     SMOKE_TEST, n_routed_experts=16, d_ff=32, top_k=8, n_shared_experts=4
+)
+
+
+# ---------------------------------------------------------------------------
+# moe-modernization task 18 (Requirement 12.5, 13.4): the *recommended*
+# configs after this spec. BASELINE / SMOKE_TEST are deliberately left
+# untouched so the parent spec's tests and trained checkpoints stay valid;
+# these are the ones to reach for on a new run. See journal entry 034 for
+# the change-by-change evidence from tasks 2–17.
+# ---------------------------------------------------------------------------
+
+# Width-aware "small init" from Nguyen & Salazar, "Transformers without
+# Tears" (2019): std = sqrt(2 / (5 * d_model)), the smallest std among the
+# Transformer's weights, designed to pair with pre-norm blocks and the
+# 1/sqrt(2 * n_layers) residual-projection scaling this project already
+# applies (task 7 / journal 023) -- together they enable stable training
+# at a large, near-warmup-free learning rate. For d_model = 256 this is
+# ~0.0395, vs the fixed 0.02 BASELINE inherits from GPT-2's d_model = 768.
+_V2_INIT_STD = round(math.sqrt(2 / (5 * BASELINE.d_model)), 4)
+
+# The recommended dense-expert config after this spec. Changes vs BASELINE,
+# each with its task/journal:
+#   - qk_norm=True         -- bounded attention-logit variance (task 6 / 022)
+#   - router_scoring="sigmoid" -- DeepSeek-V3 independent per-expert
+#                            affinities, normalized over the selected k
+#                            (task 9 / 025)
+#   - init_std=_V2_INIT_STD -- width-aware small init (task 7 / 023)
+# The pure-win TrainConfig changes (tuned AdamW betas/wd, grad clip,
+# min_lr_ratio floor) are already the defaults after tasks 2-3; pair this
+# with TrainConfig(lr_schedule="wsd") for a token-budget-flexible run
+# (task 3 / 021).
+BASELINE_V2 = dataclasses.replace(
+    BASELINE,
+    qk_norm=True,
+    router_scoring="sigmoid",
+    init_std=_V2_INIT_STD,
+)
+
+# BASELINE_V2 + DeepSeekMoE fine-grained expert segmentation: 8 experts of
+# d_ff=512 (top-2) become 32 experts of d_ff=128 (top-8), holding routed
+# FFN parameters (32*128 == 8*512) and per-token active routed FFN
+# (8*128 == 2*512) constant. The single shared expert also narrows to
+# d_ff=128, a deliberate small capacity trade for finer routing (task 11 /
+# 027, task 17 / 033).
+FINEGRAINED = dataclasses.replace(
+    BASELINE_V2,
+    n_routed_experts=32,
+    d_ff=128,
+    top_k=8,
+    n_shared_experts=1,
 )
 

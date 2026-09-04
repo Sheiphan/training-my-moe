@@ -290,12 +290,28 @@
     the entry-032 caveat).
   - _Requirements: 12.3, 12.5, 12.6_
 
-- [ ] 18. Modernized presets
-  - `configs/presets.py`: a `BASELINE_V2` (QK-norm on, sigmoid routing,
-    WSD-friendly, `init_std` scaled) documented as "the recommended config
-    after this spec", and `FINEGRAINED` (e.g. 32 experts, `d_ff≈128`,
-    top-8, 1 shared). Keep `BASELINE`/`SMOKE_TEST` untouched for parent-spec
-    tests.
-  - Journal: a short decision entry — what `BASELINE_V2` changes vs
-    `BASELINE` and the evidence from tasks 2–17 for each.
+- [x] 18. Modernized presets
+  - `configs/presets.py::BASELINE_V2` = `dataclasses.replace(BASELINE,
+    qk_norm=True, router_scoring="sigmoid",
+    init_std=sqrt(2/(5·d_model)))` — the three architecturally-safe,
+    ~free, task-backed changes; documented as "the recommended
+    dense-expert config after this spec" and to be paired with
+    `TrainConfig(lr_schedule="wsd")` (the pure-win `TrainConfig` changes
+    are already the defaults). `FINEGRAINED` = `BASELINE_V2` +
+    DeepSeekMoE segmentation (`n_routed_experts=32`, `d_ff=128`,
+    `top_k=8`, 1 shared — routed FFN budget held vs `BASELINE`). Research-
+    question axes (optimizer, schedule, MTP, balancing, MLA, z-losses,
+    document masking) deliberately stay OUT of the preset and remain
+    ablation variants. `BASELINE`/`SMOKE_TEST` byte-for-byte unchanged.
+  - Tests (+4, 382 → 386): `BASELINE`/`SMOKE_TEST` keep pre-spec defaults;
+    `BASELINE_V2` applies exactly the 3 named changes; `FINEGRAINED`
+    inherits them + holds `n_routed_experts·d_ff` and `top_k·d_ff` vs
+    `BASELINE`; both modernized presets build a model with finite,
+    `O(1)`-std untrained logits.
+  - Journal: `journey_of_a_model/034-modernized-presets.md` — a decision
+    entry: the change-by-change table (task/journal/evidence/param cost)
+    for each `BASELINE_V2` change, why the rest stay opt-in, the
+    `FINEGRAINED` FFN-budget table, measured param counts (BASELINE_V2 is
+    +384 params / +0.0016% over BASELINE; FINEGRAINED 21.7M/7.6M, 2.87×
+    sparse), Qwen3 / DeepSeek-V3 / DeepSeekMoE / Nguyen & Salazar 2019.
   - _Requirements: 12.5, 13.4_

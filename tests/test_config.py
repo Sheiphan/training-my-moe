@@ -194,6 +194,72 @@ def test_baseline_preset_constructs():
     assert BASELINE.top_k == 2
 
 
+# -- modernized presets (moe-modernization task 18, Requirement 12.5, 13.4) --
+
+
+def test_baseline_and_smoke_test_presets_are_left_untouched():
+    """Requirement 13.4 / task 18: the parent-spec presets keep pre-spec
+    defaults so existing tests and checkpoints stay valid."""
+    from configs.presets import BASELINE, SMOKE_TEST
+
+    for preset in (BASELINE, SMOKE_TEST):
+        assert preset.qk_norm is False
+        assert preset.router_scoring == "softmax"
+        assert preset.init_std == pytest.approx(0.02)
+        assert preset.mtp_depth == 0
+
+
+def test_baseline_v2_applies_exactly_the_recommended_changes():
+    import dataclasses
+    import math
+
+    from configs.presets import BASELINE, BASELINE_V2
+
+    assert BASELINE_V2.qk_norm is True
+    assert BASELINE_V2.router_scoring == "sigmoid"
+    assert BASELINE_V2.init_std == pytest.approx(math.sqrt(2 / (5 * BASELINE.d_model)), abs=1e-4)
+
+    # everything else is BASELINE
+    changed = {"qk_norm", "router_scoring", "init_std"}
+    for f in dataclasses.fields(BASELINE_V2):
+        if f.name not in changed:
+            assert getattr(BASELINE_V2, f.name) == getattr(BASELINE, f.name)
+
+
+def test_finegrained_preset_is_baseline_v2_plus_expert_segmentation():
+    from configs.presets import BASELINE, BASELINE_V2, FINEGRAINED
+
+    # inherits the V2 modernization
+    assert FINEGRAINED.qk_norm is True
+    assert FINEGRAINED.router_scoring == "sigmoid"
+
+    # fine-grained experts, routed FFN budget held vs BASELINE
+    assert FINEGRAINED.n_routed_experts == 32
+    assert FINEGRAINED.d_ff == 128
+    assert FINEGRAINED.top_k == 8
+    assert FINEGRAINED.n_shared_experts == 1
+    assert FINEGRAINED.n_routed_experts * FINEGRAINED.d_ff == BASELINE.n_routed_experts * BASELINE.d_ff
+    assert FINEGRAINED.top_k * FINEGRAINED.d_ff == BASELINE.top_k * BASELINE.d_ff
+
+
+def test_modernized_presets_construct_a_valid_model():
+    import dataclasses
+
+    import torch
+
+    from configs.presets import BASELINE_V2, FINEGRAINED
+    from qwenmoe.model.transformer import QwenMoEModel
+
+    for preset in (BASELINE_V2, FINEGRAINED):
+        model = QwenMoEModel(dataclasses.replace(preset, vocab_size=128))
+        ids = torch.randint(0, 128, (2, 16))
+        logits, _ = model(ids)
+        assert logits.shape == (2, 16, 128)
+        assert torch.isfinite(logits).all()
+        # Requirement 9.4: untrained logits stay O(1)
+        assert logits.std().item() < 5.0
+
+
 @pytest.mark.parametrize(
     "preset_name,field,expected",
     [
