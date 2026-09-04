@@ -1,5 +1,12 @@
 # Implementation Plan
 
+> **Status update (post-task-16):** tasks 13 and 14 below implemented Manim
+> scenes; all Manim scene code (`qwenmoe/viz/scenes_*.py`,
+> `scripts/render_viz.py`, `tests/test_scenes_training_errors.py`) and the
+> `manim` dependency were later removed from the project entirely. Task
+> items below are left checked as a historical record of what was built and
+> later removed, not as a description of the current codebase.
+>
 > Convention (Requirement 13.2, 13.6-13.9): finishing any task below is not
 > "done" until a dated journal entry is added under `/journey_of_a_model/`
 > (`NNN-short-slug.md`, indexed in `journey_of_a_model/README.md`)
@@ -235,6 +242,7 @@
   - Manually verify each scene renders on its own (fresh process, no
     shared state) without running any other scene first.
   - _Requirements: 7.7_
+  - **(Removed post-task-16: all Manim scene code and the `manim` dependency were later deleted from the project.)**
 
 - [x] 14. Training/run observability visualization
   - Implement `qwenmoe/viz/scenes_training.py` with a loss-curve scene and
@@ -244,6 +252,7 @@
     file raises a clear, actionable error (not a raw stack trace) before
     any Manim rendering is attempted.
   - _Requirements: 8.1, 8.2, 8.3_
+  - **(Removed post-task-16: all Manim scene code and the `manim` dependency were later deleted from the project.)**
 
 - [x] 15. Research-style comparison framework
 - [x] 15.1 Auxiliary-loss-free MoE balancing

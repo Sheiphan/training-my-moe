@@ -4,11 +4,10 @@ variant so the page can render a structurally different diagram with
 correct real math for whichever combination is toggled.
 
 Sources every number from a real trained checkpoint -- activations via
-`QwenMoEModel.forward_with_trace` (the same path every Manim scene uses)
-plus, for the matrix-multiplication deep-dive, real block-0 weight
-matrices and real RMSNorm outputs read directly off the live model (the
-same "local helper that also returns the model" pattern
-`qwenmoe/viz/scenes_embedding.py` already established) -- never a
+`QwenMoEModel.forward_with_trace` plus, for the matrix-multiplication
+deep-dive, real block-0 weight matrices and real RMSNorm outputs read
+directly off the live model (a "local helper that also returns the
+model" pattern, since `capture_trace` alone doesn't return it) -- never a
 fabricated or illustrative number (Requirement 7.1 convention).
 
 The 4 variants below reuse the real checkpoints `scripts/run_ablation_

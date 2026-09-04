@@ -1,8 +1,9 @@
 """Trace dataclasses populated by `QwenMoEModel.forward_with_trace`
 (Requirement 7.1): every intermediate tensor from one real forward pass
-over a single example prompt, in the shape a Manim scene in `qwenmoe/viz/`
-needs. No batch dimension anywhere -- tracing is always one prompt at a
-time (see `forward_with_trace`'s batch-size-1 requirement).
+over a single example prompt, in the shape a visualization consumer (e.g.
+`token_journey/`'s web walkthrough) needs. No batch dimension anywhere --
+tracing is always one prompt at a time (see `forward_with_trace`'s
+batch-size-1 requirement).
 """
 from __future__ import annotations
 
@@ -38,7 +39,7 @@ class LayerTrace:
 
 @dataclass
 class TraceBundle:
-    """Everything the Manim scenes (tasks 13-14) need from one real forward
+    """Everything a visualization consumer needs from one real forward
     pass over a single prompt, sourced only from real computation
     (Requirement 7.1) -- never illustrative/fabricated numbers.
     """

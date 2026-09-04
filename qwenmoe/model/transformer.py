@@ -55,9 +55,9 @@ class QwenMoEModel(nn.Module):
 
     def forward_with_trace(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, TraceBundle]:
         """Requirement 7.1: the exact same computation as `forward`,
-        additionally capturing every intermediate tensor a Manim scene
-        might need into a `TraceBundle`. Only supports a single sequence
-        at a time (`batch == 1`) since `TraceBundle`'s tensors are
+        additionally capturing every intermediate tensor a visualization
+        consumer might need into a `TraceBundle`. Only supports a single
+        sequence at a time (`batch == 1`) since `TraceBundle`'s tensors are
         documented without a batch dimension -- this traces one real
         example prompt, never a training batch.
         """

@@ -6,9 +6,11 @@
 ## What this project is
 A Qwen-style decoder-only transformer with a Mixture-of-Experts (MoE)
 feed-forward layer, implemented from scratch in PyTorch, trained on this
-laptop (Apple M4 Pro, 24GB RAM), then used for inference — with Manim
-animations of the real math at every architectural step, and a research-style
-comparison study across alternative techniques (positional embedding,
+laptop (Apple M4 Pro, 24GB RAM), then used for inference — with animated
+visualizations of the real math at every architectural step (originally
+built with Manim; the Manim-based scene code was later removed from the
+project entirely), and a research-style comparison study across
+alternative techniques (positional embedding,
 activation, MoE load-balancing, and stretch-goal attention/adapter variants).
 
 ## Concepts explained for a complete beginner
@@ -196,7 +198,8 @@ flowchart TB
   macOS. PyTorch will use the `mps` backend when available, falling back to
   `cpu`.
 - **Env/tooling:** `uv`-managed project, Python 3.12, PyTorch already
-  declared in `pyproject.toml`. Manim (Community Edition) added later.
+  declared in `pyproject.toml`. Manim (Community Edition) added later,
+  then removed later still once all Manim scene code was deleted.
 - **Default training corpus:** tiny Shakespeare for the smoke test,
   TinyStories ([Eldan & Li, 2023](https://arxiv.org/abs/2305.07759)) for
   the comparison study.

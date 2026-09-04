@@ -13,6 +13,14 @@ The audience is a single learner (the repo owner) who wants to deeply
 understand how an LLM works end-to-end, not to produce a production-grade or
 state-of-the-art model.
 
+> **Status update (post-task-16):** Requirement 7 (Manim Visualizations) and
+> the Manim-based scenes it describes were implemented (tasks 12-14) and
+> later **removed from the project entirely** in favor of other, non-Manim
+> visualizations (`architecture_diagram.html`, `token_journey/`,
+> `ablation_study/`, notebook-based Plotly graphs). The rest of this
+> document is left as the original approved record; Requirement 7 and any
+> Manim-specific task items below no longer reflect the current codebase.
+
 ## Assumptions & Defaults (flag anything wrong here at the approval gate)
 - **Hardware detected:** Apple M4 Pro, 14 cores, 24GB unified memory, arm64
   macOS. PyTorch will use the `mps` backend when available, falling back to

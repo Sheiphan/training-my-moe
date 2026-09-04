@@ -6,13 +6,21 @@ decoder-only MoE transformer in raw PyTorch, driven entirely by dataclass
 configs so every architectural axis named in Requirement 12 (positional
 scheme, activation, MoE balancing strategy, attention variant) is a config
 value, not a code fork. Thin `argparse` CLI scripts wrap the package for data
-prep, training, generation, ablation comparison, and Manim rendering. Every
+prep, training, generation, ablation comparison, and (originally) Manim
+rendering. Every
 module that computes something visualizable can optionally return a
 `TraceBundle` of its real intermediate tensors from a real forward pass;
-Manim scenes consume that bundle directly, so animations are never
-illustrative fabrications (Requirement 7.1). Dependencies are kept deliberately
+Manim scenes originally consumed that bundle directly, so animations were never
+illustrative fabrications (Requirement 7.1). Dependencies were originally kept
 minimal (torch, manim, huggingface_hub, pytest) to keep the "from scratch"
 feel — no `transformers`, no `datasets`, no YAML config framework.
+
+> **Status update (post-task-16):** all Manim scene code and the `manim`
+> dependency were later removed from the project entirely. `TraceBundle`/
+> `forward_with_trace`/`capture_trace` were kept, since they're
+> Manim-agnostic and are now consumed by `token_journey/`'s web walkthrough
+> instead. The rest of this document is left as the original approved
+> design record.
 
 ## Architecture
 

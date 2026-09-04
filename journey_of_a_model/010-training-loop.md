@@ -483,7 +483,7 @@ flowchart LR
   line to a plain text file, rather than one big JSON array or a
   human-formatted log line.
 - **Why it exists:** a program reading the log back later (task 14's
-  training-observability Manim scenes) can parse it one line at a time
+  now-removed training-observability Manim scenes) can parse it one line at a time
   without waiting for the whole file to finish writing or holding the
   entire file in memory — and if a run crashes mid-write, every
   already-flushed line is still valid, complete JSON, unlike a single
@@ -511,7 +511,8 @@ flowchart TD
     T -->|"type: eval
     (every eval_interval_steps)"| F
     F -.->|"read later"| VIZ["task 14: loss-curve +
-    expert-utilization Manim scenes"]
+    expert-utilization Manim scenes
+    (later removed)"]
 ```
 
 ## Diagrams: the overall `Trainer.fit` flow

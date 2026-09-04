@@ -129,7 +129,7 @@ repetition-loop finding), confirming the refactor changed nothing.
 - **What it means:** running a model's real computation exactly as
   normal, but additionally recording a copy of every intermediate value
   it computes along the way — not just the final output — so something
-  else (here, a Manim animation) can inspect and display them afterward.
+  else (here, a visualization) can inspect and display them afterward.
 - **Why it exists:** a trained neural network's forward pass normally
   only exposes its final output (logits); everything computed on the way
   there (attention scores, router probabilities, which expert handled
@@ -145,7 +145,7 @@ repetition-loop finding), confirming the refactor changed nothing.
   and a chef who also sets aside a small sample of the dish at every
   stage of cooking — the raw ingredients, the halfway-reduced sauce, the
   plated-but-ungarnished result — so a documentary crew can film each
-  step afterward (a Manim scene) without having to re-cook the entire
+  step afterward without having to re-cook the entire
   dish from a recipe card (fabricated numbers) and hope it happens to
   match what actually came out of the kitchen.
 - **Simple technical explanation:** every `forward_with_trace` method in
@@ -154,7 +154,8 @@ repetition-loop finding), confirming the refactor changed nothing.
   into a plain dataclass (`LayerTrace`, then `TraceBundle`) instead of
   letting them go out of scope unused.
 - **How it relates here:** `QwenMoEModel.forward_with_trace` is the one
-  entry point every Manim scene in `qwenmoe/viz/` depends on
+  entry point every visualization in `qwenmoe/viz/` (and later
+  `token_journey/`'s web walkthrough) depends on
   (Requirement 7.1); `capture_trace(checkpoint_path, prompt)` is the
   thin wrapper that loads a real checkpoint and calls it under
   `torch.no_grad()` (no need to track gradients — nothing here gets
@@ -193,11 +194,12 @@ flowchart TB
     EMB -. embeddings .-> BUNDLE
 ```
 
-The real pipeline a Manim scene (tasks 13-14) uses to get real numbers:
+The real pipeline a visualization (originally tasks 13-14's Manim scenes,
+later removed; now `token_journey/`'s web walkthrough) uses to get real numbers:
 
 ```mermaid
 sequenceDiagram
-    participant Scene as Manim scene (task 13+)
+    participant Scene as Visualization consumer
     participant Common as viz/common.py::capture_trace
     participant Ckpt as checkpoint (.pt file)
     participant Model as QwenMoEModel
@@ -233,8 +235,8 @@ transformation step by step, not just flash the end state.
 
 **Does tracing slow down or change a real training run?**  No —
 `forward_with_trace` is never called by `Trainer.fit` or `generate()`;
-it's an entirely separate method only `capture_trace` and (later) Manim
-scenes call, always under `torch.no_grad()`. Training keeps using the
+it's an entirely separate method only `capture_trace` and its
+visualization callers use, always under `torch.no_grad()`. Training keeps using the
 original `forward` exactly as before.
 
 **Why is `expert_outputs` a `dict[int, Tensor]` instead of a list or a

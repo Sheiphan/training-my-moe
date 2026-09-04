@@ -12,7 +12,7 @@ wheels/
 # macOS Finder metadata
 .DS_Store
 
-# Manim render output (regeneratable from qwenmoe/viz/*.py)
+# Old render output (Manim removed; kept ignored, safe to delete)
 media/
 
 # Downloaded/cached training corpora (regeneratable via download_corpus)
