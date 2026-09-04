@@ -18,6 +18,7 @@ dev = [
 notebooks = [
     "ipykernel>=7.3.0",
     "matplotlib>=3.11.1",
+    "plotly>=7.0.0",
 ]
 
 [build-system]
