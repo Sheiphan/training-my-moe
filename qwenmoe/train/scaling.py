@@ -100,6 +100,47 @@ def chinchilla_budget(active_params: int) -> int:
     return 20 * active_params
 
 
+def moe_budget_note(total_params: int, active_params: int) -> str:
+    """A one-paragraph caveat to print alongside `chinchilla_budget` for a
+    sparse MoE model (moe-modernization Requirement 12.6).
+
+    `chinchilla_budget` multiplies `20 x active_params`, and `20x` is the
+    compute-optimal tokens/parameter ratio Hoffmann et al. (2022) fitted on
+    **dense** models, where every parameter is active for every token so
+    `total == active`. A sparse MoE breaks that identity: it has far more
+    total parameters than it activates per token, and Clark et al. (2022,
+    "Unified Scaling Laws for Routed Language Models") show its
+    compute-optimal token budget sits **between** `20 x active` and
+    `20 x total` -- a routed model benefits from more data than its active
+    count alone implies, because the extra experts still have to be trained,
+    but less than its full parameter count would demand. So treat
+    `20 x active` as a floor, not the target.
+    """
+    if total_params < 1 or active_params < 1:
+        raise ValueError(
+            f"total_params and active_params must be >= 1, got {total_params}, {active_params}"
+        )
+    if total_params < active_params:
+        raise ValueError(
+            f"total_params ({total_params}) cannot be less than active_params ({active_params})"
+        )
+    sparsity = total_params / active_params
+    active_ref = chinchilla_budget(active_params)
+    total_ref = chinchilla_budget(total_params)
+    if sparsity < 1.05:
+        return (
+            f"model is ~dense (total {total_params:,} ~= active {active_params:,}); "
+            f"chinchilla_budget's 20 x active = {active_ref:,} tokens applies directly."
+        )
+    return (
+        f"MoE sparsity: {active_params:,} active of {total_params:,} total "
+        f"params ({sparsity:.1f}x). Chinchilla's 20x tokens/param is a DENSE-model "
+        f"constant (total == active); for a sparse MoE the compute-optimal budget "
+        f"lies between 20 x active = {active_ref:,} and 20 x total = {total_ref:,} tokens "
+        f"(Clark et al. 2022). Use 20 x active as a floor, not the target."
+    )
+
+
 def _training_step(model: QwenMoEModel, x: torch.Tensor, y: torch.Tensor) -> None:
     model.zero_grad(set_to_none=True)
     logits, extras = model(x)

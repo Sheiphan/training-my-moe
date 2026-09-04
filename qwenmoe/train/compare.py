@@ -206,6 +206,7 @@ def run_comparison(
     seeds: tuple[int, ...] | list[int] | None = None,
     param_matched: bool = False,
     baseline_name: str | None = None,
+    train_overrides: dict[str, dict] | None = None,
 ) -> ComparisonReport:
     """Trains one `QwenMoEModel` per `variants` entry -- `name ->
     dataclasses.replace(base_config, **overrides)` -- on the identical
@@ -234,11 +235,20 @@ def run_comparison(
     variant's `d_ff` is bisected so its total parameter count matches the
     baseline's within 2%. `comparison_mode` on each result records which
     mode was used. `baseline_name` defaults to the first key of `variants`.
+
+    `train_overrides` (moe-modernization Requirement 12.5): `{name: {field:
+    value}}` `TrainConfig` deltas per variant, so axes that live on
+    `TrainConfig` rather than `ModelConfig` -- `optimizer="muon"`,
+    `lr_schedule="wsd"` -- can be compared too. The shared token budget
+    (`total_tokens`, `batch_size`, `seq_len`) must not be overridden or the
+    comparison stops being compute-matched (Requirement 12.6); this is the
+    caller's responsibility.
     """
     seed_tuple: tuple[int, ...] = tuple(seeds) if seeds is not None else (train_config.seed,)
     if not seed_tuple:
         raise ValueError("seeds must be non-empty")
     baseline = baseline_name if baseline_name is not None else next(iter(variants))
+    train_overrides = train_overrides or {}
 
     train_dataset, val_dataset, tokenizer_meta = _load_fixed_slice_datasets(
         data_config, train_config.seq_len
@@ -281,11 +291,11 @@ def run_comparison(
             model = QwenMoEModel(variant_config)
 
             trainer = Trainer(run_dir, tokenizer_meta=tokenizer_meta)
+            seed_train_config = dataclasses.replace(
+                train_config, **train_overrides.get(name, {}), seed=seed
+            )
             train_result = trainer.fit(
-                model,
-                train_dataset,
-                val_dataset,
-                dataclasses.replace(train_config, seed=seed),
+                model, train_dataset, val_dataset, seed_train_config
             )
             per_seed_val_loss.append(train_result.final_val_loss)
             per_seed_val_ppl.append(train_result.val_perplexity)

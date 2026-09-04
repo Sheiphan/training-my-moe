@@ -11,6 +11,7 @@ from qwenmoe.train.scaling import (
     chinchilla_budget,
     count_params,
     epochs_for_budget,
+    moe_budget_note,
 )
 
 
@@ -96,6 +97,33 @@ def test_chinchilla_budget_arithmetic():
 def test_chinchilla_budget_rejects_non_positive():
     with pytest.raises(ValueError):
         chinchilla_budget(0)
+
+
+# -- moe_budget_note (moe-modernization Requirement 12.6) ------------------
+
+
+def test_moe_budget_note_states_both_bounds_and_the_dense_constant():
+    note = moe_budget_note(total_params=1_000_000, active_params=250_000)
+    assert "4.0x" in note  # 1_000_000 / 250_000
+    assert f"{20 * 250_000:,}" in note  # 20 x active floor
+    assert f"{20 * 1_000_000:,}" in note  # 20 x total ceiling
+    assert "Clark et al. 2022" in note
+    assert "floor" in note.lower()
+
+
+def test_moe_budget_note_near_dense_model_says_chinchilla_applies_directly():
+    note = moe_budget_note(total_params=101_000, active_params=100_000)  # 1.01x
+    assert "dense" in note.lower()
+    assert f"{20 * 100_000:,}" in note
+
+
+@pytest.mark.parametrize(
+    "total,active",
+    [(0, 10), (100, 0), (50, 100)],  # non-positive, non-positive, total < active
+)
+def test_moe_budget_note_rejects_invalid_args(total, active):
+    with pytest.raises(ValueError):
+        moe_budget_note(total, active)
 
 
 def test_epochs_for_budget_arithmetic():

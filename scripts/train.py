@@ -23,6 +23,7 @@ from qwenmoe.data.dataset import TokenDataset, train_val_split
 from qwenmoe.data.download import prepared_data_dir
 from qwenmoe.model.transformer import QwenMoEModel
 from qwenmoe.tokenizer.base import build_tokenizer
+from qwenmoe.train.scaling import chinchilla_budget, count_params, moe_budget_note
 from qwenmoe.train.trainer import Trainer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -150,6 +151,15 @@ def main() -> None:
         model_config.d_model,
         model_config.n_layers,
     )
+    breakdown = count_params(model)
+    logger.info(
+        "params: %s total / %s active per token | chinchilla 20x active = %s tokens (budget: %s)",
+        f"{breakdown.total:,}",
+        f"{breakdown.active:,}",
+        f"{chinchilla_budget(breakdown.active):,}",
+        f"{args.total_tokens:,}",
+    )
+    logger.info("MoE budget note: %s", moe_budget_note(breakdown.total, breakdown.active))
     logger.info(
         "data: corpus=%s tokenizer=%s train_tokens=%d val_tokens=%d",
         args.corpus,

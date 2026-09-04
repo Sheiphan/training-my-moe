@@ -19,11 +19,26 @@ import logging
 from pathlib import Path
 
 import configs.presets as presets
-from qwenmoe.config import DataConfig, TrainConfig
+from qwenmoe.config import DataConfig, ModelConfig, TrainConfig
+from qwenmoe.model.transformer import QwenMoEModel
 from qwenmoe.train.compare import ComparisonReport, run_comparison
+from qwenmoe.train.scaling import chinchilla_budget, count_params, moe_budget_note
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _log_baseline_budget(base_config: ModelConfig) -> None:
+    """moe-modernization Requirement 12.6: print the Chinchilla reference
+    budget for the baseline preset plus the sparse-MoE caveat."""
+    breakdown = count_params(QwenMoEModel(base_config))
+    logger.info(
+        "baseline params: %s total / %s active | chinchilla 20x active = %s tokens",
+        f"{breakdown.total:,}",
+        f"{breakdown.active:,}",
+        f"{chinchilla_budget(breakdown.active):,}",
+    )
+    logger.info("MoE budget note: %s", moe_budget_note(breakdown.total, breakdown.active))
 
 
 def _report_to_json(report: ComparisonReport) -> dict:
@@ -135,6 +150,7 @@ def main() -> None:
 
     seeds = tuple(args.seeds) if args.seeds else (args.seed,)
     logger.info("comparing presets: %s", ", ".join(args.presets))
+    _log_baseline_budget(base_config)
     logger.info(
         "fixed slice: %d tokens (seed=%d), budget: %d tokens per variant, seeds: %s%s",
         args.fixed_slice_tokens,

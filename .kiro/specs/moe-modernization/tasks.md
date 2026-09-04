@@ -255,17 +255,39 @@
     Transformer), Bouthillier et al. 2021 / Dodge et al. 2019.
   - _Requirements: 12.1, 12.2, 12.4_
 
-- [ ] 17. Ablation methodology: refreshed menu, MoE budget note, TinyStories default
-  - Extend `scripts/run_ablation_study.py::VARIANTS` with `OPT_MUON`,
-    `ROUTE_SIGMOID`, `ATT_QKNORM`, `SCHED_WSD`, `MTP_D1`, `MOE_FINEGRAINED`.
-    Default corpus → TinyStories BPE (parent Tier 2); keep a
-    `--smoke` flag for the fast Shakespeare run.
-  - `scaling.py::moe_budget_note(total, active)`; call it in the training
-    CLIs' startup summary.
-  - Tests: `moe_budget_note` arithmetic and wording; each new preset
-    constructs and trains a few steps.
-  - Journal: the 2026 axis menu and why NoPE/ALiBi/GEGLU are settled
-    questions; MoE vs dense compute-optimal ratios (Clark et al.).
+- [x] 17. Ablation methodology: refreshed menu, MoE budget note, TinyStories default
+  - `scripts/run_ablation_study.py::VARIANTS` entries are now 4-tuples
+    `(axis, label, ModelConfig, train_overrides)`; +6 rows: `OPT_MUON`
+    (`train_overrides={"optimizer":"muon"}`), `SCHED_WSD`
+    (`{"lr_schedule":"wsd"}`), `ROUTE_SIGMOID`, `ATT_QKNORM`, `MTP_D1`,
+    `MOE_FINEGRAINED`. `configs/presets.py` gains `ROUTE_SIGMOID` /
+    `ATT_QKNORM` / `MTP_D1` (one axis off `SMOKE_TEST`) and
+    `MOE_FINEGRAINED` (16 experts × `d_ff=32`, `top_k=8`, 4 shared — every
+    FFN budget held ~constant, +0.6% total params from the wider router).
+    `run_comparison(..., train_overrides={name: {TrainConfig field}})`
+    applies per-variant `TrainConfig` deltas (`replace(train_config,
+    **ov, seed=seed)`), keeping the token budget shared. Default corpus →
+    `tiny_stories` / `bpe` with `--smoke` restoring char tiny-Shakespeare.
+  - `qwenmoe/train/scaling.py::moe_budget_note(total, active)` — states
+    `20×` is a dense constant, the compute-optimal MoE budget lies in
+    `[20·active, 20·total]` (Clark et al. 2022), `20·active` is a floor;
+    logged at startup by `scripts/train.py`, `scripts/run_comparison.py`,
+    `scripts/run_ablation_study.py` alongside `count_params` /
+    `chinchilla_budget`.
+  - Tests (+17, 365 → 382): `moe_budget_note` bounds/wording/validation;
+    `ROUTE_SIGMOID`/`ATT_QKNORM`/`MTP_D1` in the one-axis check +
+    `MOE_FINEGRAINED` FFN-budget test; new `test_run_ablation_study.py` —
+    every `VARIANTS` entry is a valid 4-tuple naming real `TrainConfig`
+    fields, each new axis constructs + trains via `run_comparison`, a Muon
+    `train_overrides` delta produces a Muon checkpoint with an unchanged
+    `ModelConfig`.
+  - Journal: `journey_of_a_model/033-ablation-menu-and-moe-budget-note.md`
+    — the `ModelConfig` vs `TrainConfig` axis split + `train_overrides`,
+    fine-grained segmentation with FFN budgets tabulated (DeepSeekMoE),
+    the `[20·active, 20·total]` budget band derived on `BASELINE`'s real
+    23.5M/9.3M split (Clark et al. 2022), why TinyStories is the real
+    tier; measured single-seed run of all 6 new axes (illustrative, with
+    the entry-032 caveat).
   - _Requirements: 12.3, 12.5, 12.6_
 
 - [ ] 18. Modernized presets

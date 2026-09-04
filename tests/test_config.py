@@ -202,6 +202,10 @@ def test_baseline_preset_constructs():
         ("ACT_GEGLU", "activation", "geglu"),
         ("ACT_GELU", "activation", "gelu"),
         ("MOE_LOSSFREE", "moe_balancing", "loss_free"),
+        # moe-modernization task 17 (Requirement 12.5)
+        ("ROUTE_SIGMOID", "router_scoring", "sigmoid"),
+        ("ATT_QKNORM", "qk_norm", True),
+        ("MTP_D1", "mtp_depth", 1),
     ],
 )
 def test_ablation_presets_swap_exactly_one_axis_from_smoke_test(preset_name, field, expected):
@@ -219,3 +223,27 @@ def test_ablation_presets_swap_exactly_one_axis_from_smoke_test(preset_name, fie
         assert getattr(preset, other_field) == getattr(presets.SMOKE_TEST, other_field), (
             f"{preset_name}.{other_field} unexpectedly differs from SMOKE_TEST"
         )
+
+
+def test_moe_finegrained_preset_holds_ffn_params_constant():
+    """moe-modernization task 17: MOE_FINEGRAINED changes granularity
+    (more, smaller experts + higher top_k + more shared experts) while
+    keeping every FFN parameter budget ~constant vs SMOKE_TEST, so a
+    comparison isolates granularity, not capacity."""
+    from configs.presets import MOE_FINEGRAINED, SMOKE_TEST
+
+    def routed_total(c):
+        return c.n_routed_experts * c.d_ff
+
+    def routed_active(c):
+        return c.top_k * c.d_ff
+
+    def shared_total(c):
+        return c.n_shared_experts * c.d_ff
+
+    assert routed_total(MOE_FINEGRAINED) == routed_total(SMOKE_TEST)  # 16*32 == 4*128
+    assert routed_active(MOE_FINEGRAINED) == routed_active(SMOKE_TEST)  # 8*32 == 2*128
+    assert shared_total(MOE_FINEGRAINED) == shared_total(SMOKE_TEST)  # 4*32 == 1*128
+
+    assert MOE_FINEGRAINED.n_routed_experts == 16
+    assert MOE_FINEGRAINED.top_k == 8

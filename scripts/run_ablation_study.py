@@ -7,51 +7,85 @@ page -- same "never fabricate a number" convention as
 Every variant changes exactly ONE axis relative to `SMOKE_TEST` and trains
 on the identical fixed token slice / token budget via
 `qwenmoe.train.compare.run_comparison` (Requirements 11.5, 12.6), so any
-metric difference reflects only that axis. `ATTN_MLA` and `TIE_FALSE` are
-ad-hoc overrides (not named presets in configs/presets.py) covering two
-axes the architecture toggle bar (architecture_diagram.html) exposes that
-configs/presets.py doesn't have a preset for; `mla_latent_dim=16` matches
-the value architecture_diagram.html already illustrates for SMOKE_TEST
-(`latentDim = headDim = 16`).
+metric difference reflects only that axis. Axes that live on `TrainConfig`
+rather than `ModelConfig` (`OPT_MUON` -> `optimizer="muon"`, `SCHED_WSD` ->
+`lr_schedule="wsd"`) are passed as `run_comparison`'s per-variant
+`train_overrides` (moe-modernization Requirement 12.5). `ATTN_MLA` and
+`TIE_FALSE` are ad-hoc overrides covering two axes the architecture toggle
+bar (architecture_diagram.html) exposes; `mla_latent_dim=16` matches the
+value it illustrates for SMOKE_TEST (`latentDim = headDim = 16`).
+
+The default corpus is TinyStories with the from-scratch BPE tokenizer
+(parent spec Tier 2, Requirement 12.3); `--smoke` runs the fast
+char-level tiny-Shakespeare version instead.
 
 Usage:
-    uv run python scripts/prepare_data.py --corpus tiny_shakespeare --tokenizer-type char
+    uv run python scripts/prepare_data.py --corpus tiny_stories --tokenizer-type bpe --split-documents
     uv run python scripts/run_ablation_study.py
+    # or, the fast smoke version:
+    uv run python scripts/prepare_data.py --corpus tiny_shakespeare --tokenizer-type char
+    uv run python scripts/run_ablation_study.py --smoke
 """
 from __future__ import annotations
 
 import argparse
 import dataclasses
 import json
+import logging
 from pathlib import Path
 
 import torch
 
-from configs.presets import ACT_GEGLU, ACT_GELU, MOE_LOSSFREE, POS_ALIBI, POS_NOPE, SMOKE_TEST
+from configs.presets import (
+    ACT_GEGLU,
+    ACT_GELU,
+    ATT_QKNORM,
+    MOE_FINEGRAINED,
+    MOE_LOSSFREE,
+    MTP_D1,
+    POS_ALIBI,
+    POS_NOPE,
+    ROUTE_SIGMOID,
+    SMOKE_TEST,
+)
 from qwenmoe.config import DataConfig, ModelConfig, TrainConfig
 from qwenmoe.model.moe import LossFreeBalancer, select_top_k
+from qwenmoe.model.transformer import QwenMoEModel
 from qwenmoe.train.compare import run_comparison
+from qwenmoe.train.scaling import chinchilla_budget, count_params, moe_budget_note
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 BASELINE_NAME = "SMOKE_TEST"
 
-# name -> (axis, human label, full ModelConfig)
-VARIANTS: dict[str, tuple[str, str, ModelConfig]] = {
-    "SMOKE_TEST": ("baseline", "SMOKE_TEST (baseline)", SMOKE_TEST),
-    "POS_NOPE": ("positional", "NoPE", POS_NOPE),
-    "POS_ALIBI": ("positional", "ALiBi", POS_ALIBI),
-    "ACT_GEGLU": ("activation", "GEGLU", ACT_GEGLU),
-    "ACT_GELU": ("activation", "GELU", ACT_GELU),
-    "MOE_LOSSFREE": ("moe_balancing", "Loss-Free", MOE_LOSSFREE),
+# name -> (axis, human label, full ModelConfig, TrainConfig overrides)
+VARIANTS: dict[str, tuple[str, str, ModelConfig, dict]] = {
+    "SMOKE_TEST": ("baseline", "SMOKE_TEST (baseline)", SMOKE_TEST, {}),
+    "POS_NOPE": ("positional", "NoPE", POS_NOPE, {}),
+    "POS_ALIBI": ("positional", "ALiBi", POS_ALIBI, {}),
+    "ACT_GEGLU": ("activation", "GEGLU", ACT_GEGLU, {}),
+    "ACT_GELU": ("activation", "GELU", ACT_GELU, {}),
+    "MOE_LOSSFREE": ("moe_balancing", "Loss-Free", MOE_LOSSFREE, {}),
     "ATTN_MLA": (
         "attention",
         "MLA",
         dataclasses.replace(SMOKE_TEST, attention_variant="mla", mla_latent_dim=16),
+        {},
     ),
     "TIE_FALSE": (
         "tie_word_embeddings",
         "Untied embeddings",
         dataclasses.replace(SMOKE_TEST, tie_word_embeddings=False),
+        {},
     ),
+    # -- moe-modernization axes (task 17, Requirement 12.5) --
+    "OPT_MUON": ("optimizer", "Muon", SMOKE_TEST, {"optimizer": "muon"}),
+    "SCHED_WSD": ("lr_schedule", "WSD schedule", SMOKE_TEST, {"lr_schedule": "wsd"}),
+    "ROUTE_SIGMOID": ("router_scoring", "Sigmoid routing", ROUTE_SIGMOID, {}),
+    "ATT_QKNORM": ("qk_norm", "QK-norm", ATT_QKNORM, {}),
+    "MTP_D1": ("mtp_depth", "MTP depth 1", MTP_D1, {}),
+    "MOE_FINEGRAINED": ("expert_granularity", "Fine-grained experts (16, top-8)", MOE_FINEGRAINED, {}),
 }
 
 
@@ -138,6 +172,19 @@ def _bias_mechanism_demo() -> dict:
     }
 
 
+def _startup_budget_note(config: ModelConfig, vocab_size: int) -> None:
+    """Log the Chinchilla reference budget plus the sparse-MoE caveat
+    (moe-modernization Requirement 12.6) for the baseline shape."""
+    breakdown = count_params(QwenMoEModel(dataclasses.replace(config, vocab_size=vocab_size)))
+    logger.info(
+        "baseline params: %s total / %s active per token | chinchilla 20x active = %s tokens",
+        f"{breakdown.total:,}",
+        f"{breakdown.active:,}",
+        f"{chinchilla_budget(breakdown.active):,}",
+    )
+    logger.info("MoE budget note: %s", moe_budget_note(breakdown.total, breakdown.active))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -146,15 +193,31 @@ def main() -> None:
         help="skip (re-)training; rebuild ablation_study/data/ablation.js from each "
         "variant's already-written runs/ablation_study/<name>/logs/train.jsonl",
     )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="use the fast char-level tiny-Shakespeare corpus instead of the default "
+        "TinyStories BPE tier (Requirement 12.3)",
+    )
     args = parser.parse_args()
 
-    data_config = DataConfig(
-        corpus="tiny_shakespeare",
-        tokenizer_type="char",
-        cache_dir=Path(".cache/data"),
-        fixed_slice_tokens=200_000,
-        fixed_slice_seed=0,
-    )
+    if args.smoke:
+        data_config = DataConfig(
+            corpus="tiny_shakespeare",
+            tokenizer_type="char",
+            cache_dir=Path(".cache/data"),
+            fixed_slice_tokens=200_000,
+            fixed_slice_seed=0,
+        )
+    else:
+        data_config = DataConfig(
+            corpus="tiny_stories",
+            tokenizer_type="bpe",
+            bpe_vocab_size=4096,
+            cache_dir=Path(".cache/data"),
+            fixed_slice_tokens=1_000_000,
+            fixed_slice_seed=0,
+        )
     train_config = TrainConfig(
         batch_size=64,
         seq_len=128,
@@ -170,31 +233,44 @@ def main() -> None:
     output_dir = Path("runs/ablation_study")
     tokens_per_step = train_config.batch_size * train_config.seq_len
 
-    if args.finalize_only:
-        from qwenmoe.data.download import prepared_data_dir
-        from qwenmoe.tokenizer.base import build_tokenizer
+    from qwenmoe.data.download import prepared_data_dir
+    from qwenmoe.tokenizer.base import build_tokenizer
 
-        tokenizer = build_tokenizer(data_config)
-        tokenizer.load(prepared_data_dir(data_config) / "tokenizer.json")
-        vocab_size = tokenizer.vocab_size
+    tokenizer = build_tokenizer(data_config)
+    tokenizer.load(prepared_data_dir(data_config) / "tokenizer.json")
+    vocab_size = tokenizer.vocab_size
+    _startup_budget_note(SMOKE_TEST, vocab_size)
+
+    if args.finalize_only:
         configs_by_name = {
-            name: dataclasses.replace(cfg, vocab_size=vocab_size) for name, (_, _, cfg) in VARIANTS.items()
+            name: dataclasses.replace(cfg, vocab_size=vocab_size)
+            for name, (_, _, cfg, _) in VARIANTS.items()
         }
         log_paths = {name: output_dir / name / "logs" / "train.jsonl" for name in VARIANTS}
     else:
-        variants_for_run = {name: dataclasses.asdict(cfg) for name, (_, _, cfg) in VARIANTS.items()}
-        report = run_comparison(SMOKE_TEST, variants_for_run, data_config, train_config, output_dir)
+        variants_for_run = {name: dataclasses.asdict(cfg) for name, (_, _, cfg, _) in VARIANTS.items()}
+        train_overrides = {name: ov for name, (_, _, _, ov) in VARIANTS.items() if ov}
+        report = run_comparison(
+            SMOKE_TEST,
+            variants_for_run,
+            data_config,
+            train_config,
+            output_dir,
+            train_overrides=train_overrides,
+            baseline_name=BASELINE_NAME,
+        )
         configs_by_name = {name: report.variants[name].config for name in VARIANTS}
         log_paths = {name: report.variants[name].log_path for name in VARIANTS}
 
     variants_out = {}
-    for name, (axis, label, _cfg) in VARIANTS.items():
+    for name, (axis, label, _cfg, train_ov) in VARIANTS.items():
         parsed = _read_log(log_paths[name])
         parsed["tokens_per_sec"] = tokens_per_step / parsed["mean_step_elapsed_s"]
         variants_out[name] = {
             "axis": axis,
             "label": label,
             "config": dataclasses.asdict(configs_by_name[name]),
+            "train_overrides": train_ov,
             **parsed,
         }
 
