@@ -1,0 +1,76 @@
+{
+  "config": {
+    "corpus": "tiny_shakespeare",
+    "tokenizer": "char",
+    "vocab_size": 65,
+    "fixed_slice_tokens": 1000000,
+    "batch_size": 32,
+    "seq_len": 256,
+    "total_tokens": 2500000,
+    "steps": 305,
+    "seeds": [
+      1337,
+      2024
+    ],
+    "device": "cpu",
+    "lr": 0.0003,
+    "lr_schedule": "cosine",
+    "warmup_steps": 30
+  },
+  "variants": {
+    "BASELINE": {
+      "params_total": 22445568,
+      "params_active": 8289792,
+      "params_total_bpe4096": 23477504,
+      "params_active_bpe4096": 9321728,
+      "val_loss_mean": 1.7835704803466796,
+      "val_loss_std": 0.019320283944787867,
+      "val_ppl_mean": 5.951622049621219,
+      "val_ppl_std": 0.11497987486548165,
+      "train_loss_mean": 1.6228759288787842,
+      "delta_val_loss_vs_baseline": 0.0,
+      "within_seed_noise": null,
+      "tokens_per_sec_cpu": 10250.271354876408,
+      "per_seed_val_loss": [
+        1.7699089765548706,
+        1.7972319841384887
+      ]
+    },
+    "BASELINE_V2": {
+      "params_total": 22445952,
+      "params_active": 8290176,
+      "params_total_bpe4096": 23477888,
+      "params_active_bpe4096": 9322112,
+      "val_loss_mean": 1.7113858461380005,
+      "val_loss_std": 0.01498916842468712,
+      "val_ppl_mean": 5.536940068047163,
+      "val_ppl_std": 0.08299101959039117,
+      "train_loss_mean": 1.5007749199867249,
+      "delta_val_loss_vs_baseline": -0.07218463420867915,
+      "within_seed_noise": false,
+      "tokens_per_sec_cpu": 7807.832812672479,
+      "per_seed_val_loss": [
+        1.721984788775444,
+        1.700786903500557
+      ]
+    },
+    "FINEGRAINED": {
+      "params_total": 20713344,
+      "params_active": 6557568,
+      "params_total_bpe4096": 21745280,
+      "params_active_bpe4096": 7589504,
+      "val_loss_mean": 1.8506452053785325,
+      "val_loss_std": 0.00977704468610857,
+      "val_ppl_mean": 6.3640763198578405,
+      "val_ppl_std": 0.06222086727984611,
+      "train_loss_mean": 1.6347163319587708,
+      "delta_val_loss_vs_baseline": 0.06707472503185286,
+      "within_seed_noise": false,
+      "tokens_per_sec_cpu": 4930.438890527798,
+      "per_seed_val_loss": [
+        1.8437317907810211,
+        1.8575586199760437
+      ]
+    }
+  }
+}
