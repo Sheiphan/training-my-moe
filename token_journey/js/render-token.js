@@ -1,7 +1,7 @@
 /* token_journey/js/render-token.js
  * Per-step "real numbers" panel + the live expert-highlight sync. Every
- * value here is read from `TJ.store` (the CURRENT variant's slice of
- * window.TRACE_DATA, see store.js) at render time -- nothing is invented
+ * value here is read from `TJ.store` (the CURRENT variant's trace, lazily
+ * loaded into window.TRACE_VARIANTS, see store.js) at render time -- nothing is invented
  * client-side except the two "residual add" steps, which are an EXACT
  * sum of two other real captured vectors (addition needs no un-captured
  * weights, so it's still a real, correct number, not an approximation).

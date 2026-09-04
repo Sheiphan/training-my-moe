@@ -1,7 +1,7 @@
 [project]
 name = "training-my-moe"
 version = "0.1.0"
-description = "Add your description here"
+description = "A Qwen-/DeepSeek-V2-era Mixture-of-Experts decoder-only transformer built from scratch in PyTorch, with an engineering journal, a notebook tour, and interactive visualizations."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

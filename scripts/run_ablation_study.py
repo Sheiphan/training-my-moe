@@ -12,7 +12,7 @@ rather than `ModelConfig` (`OPT_MUON` -> `optimizer="muon"`, `SCHED_WSD` ->
 `lr_schedule="wsd"`) are passed as `run_comparison`'s per-variant
 `train_overrides` (moe-modernization Requirement 12.5). `ATTN_MLA` and
 `TIE_FALSE` are ad-hoc overrides covering two axes the architecture toggle
-bar (architecture_diagram.html) exposes; `mla_latent_dim=16` matches the
+bar (token_journey/architecture.html) exposes; `mla_latent_dim=16` matches the
 value it illustrates for SMOKE_TEST (`latentDim = headDim = 16`).
 
 The default corpus is TinyStories with the from-scratch BPE tokenizer

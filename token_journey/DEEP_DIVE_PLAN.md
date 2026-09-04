@@ -7,7 +7,7 @@ actual numbers: input matrix/vector as a grid of real cells, the real
 learned weight matrix as a grid of real cells, and an animated
 multiply-accumulate sweep that fills in each output cell one at a time,
 derived directly from the formula shown above it. This is additive — the
-existing 19-step walkthrough (camera zoom, narrative, KaTeX formula, real
+existing walkthrough (camera zoom, narrative, KaTeX formula, real
 numbers panel) stays exactly as-is; "zoom into the math" is a new, optional
 expansion per step.
 
@@ -130,6 +130,15 @@ Existing step id -> operation type -> viz component -> new data needed.
 ## Completion status
 All 17 computational steps now expose exact real-number math. The intro
 and repeat slides are intentionally conceptual. The finished page was
-verified by scripted desktop and mobile sweeps across all 19 steps, all
+verified by scripted desktop and mobile sweeps across all steps, all
 expert tabs, and all matrix controls with zero console/KaTeX errors,
 non-finite values, or page-level overflow.
+
+---
+
+> **Status note (entry 036, 2026-09-05).** This plan is complete and shipped. Since it was
+> written the page grew from 4 variants to 7 (adding `BASELINE`, `BASELINE_V2` and `FINEGRAINED`),
+> so the step count is now 19 or 20 depending on the architecture — a QK-norm model has an extra
+> step. Traces are also lazy-loaded per variant from `data/manifest.js` rather than one `trace.js`.
+> The two large modern variants ship activations but not per-expert weight matrices, so the expert
+> matmul dive described here is hidden for them and the page says why.
