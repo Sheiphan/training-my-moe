@@ -125,3 +125,69 @@ FINEGRAINED = dataclasses.replace(
     n_shared_experts=1,
 )
 
+
+# ---------------------------------------------------------------------------
+# Standalone scale-up request (not a moe-modernization spec task): a bigger
+# dataset (tiny_stories, char-level -- ~22.5M real tokens, vs. tiny_shakespeare's
+# ~1M) and a bigger model (~100M params, vs. BASELINE's ~23.5M), for smoke-testing
+# scripts/prepare_data.py -> scripts/train.py at this larger scale rather than
+# a full/converged training run. Built off BASELINE_V2 (qk_norm, sigmoid
+# routing, width-aware init), not plain BASELINE, since journal 034/035
+# recommend those as the defaults for any new run.
+# ---------------------------------------------------------------------------
+
+# BASELINE_V2's own _V2_INIT_STD is only valid at BASELINE's d_model=256;
+# recomputed here for this preset's own (2x bigger) d_model.
+_SCALE_100M_INIT_STD = round(math.sqrt(2 / (5 * 512)), 4)
+
+# ~104.7M total / ~38.6M active params per token at vocab_size=91 (a
+# from-scratch char tokenizer's real size over TinyStories' validation
+# split -- see qwenmoe/data/download.py), sparsity 2.71x, matching
+# BASELINE's own ratio exactly. Every width/head dimension is exactly 2x
+# BASELINE's; n_layers is 6->7 (not a full 2x -- a full 2x depth landed
+# near ~120M) so the total lands close to the requested ~100M.
+SCALE_100M = dataclasses.replace(
+    BASELINE_V2,
+    vocab_size=91,
+    d_model=512,
+    n_layers=7,
+    n_heads=8,
+    n_kv_heads=4,
+    d_ff=1024,
+    n_shared_experts=1,
+    n_routed_experts=8,
+    top_k=2,
+    max_seq_len=256,
+    init_std=_SCALE_100M_INIT_STD,
+)
+
+# Follow-up scale-up: "how big a model can I actually train on this device"
+# (MacBook, M4 Pro, 24GB unified memory). Empirically measured (not
+# theoretical) via torch.mps.current_allocated_memory() peak sampling --
+# ~104.7M and ~334M both trained fast/comfortably (<8GB peak); ~400-500M
+# hit a real cliff (20-100x wall-clock slowdown from unified-memory
+# swap/compression thrashing, not a clean OOM error) with this machine's
+# normal everyday load (VS Code, Pylance, idle Jupyter kernels) already
+# sharing the same 24GB. ~300M is the confirmed-safe ceiling at batch=16/
+# seq=256, fp32 AdamW.
+_SCALE_300M_INIT_STD = round(math.sqrt(2 / (5 * 768)), 4)
+
+# ~334.4M total / ~122.0M active params per token at vocab_size=91,
+# sparsity 2.74x. d_model/head_dim/d_ff are 1.5x SCALE_100M's; n_layers
+# 7->10 -- the combination measured to land closest to the ~300M safe
+# ceiling (a full proportional scale-up overshot it).
+SCALE_300M = dataclasses.replace(
+    BASELINE_V2,
+    vocab_size=91,
+    d_model=768,
+    n_layers=10,
+    n_heads=12,
+    n_kv_heads=4,
+    d_ff=1536,
+    n_shared_experts=1,
+    n_routed_experts=8,
+    top_k=2,
+    max_seq_len=256,
+    init_std=_SCALE_300M_INIT_STD,
+)
+

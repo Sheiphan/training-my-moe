@@ -291,6 +291,60 @@ def test_ablation_presets_swap_exactly_one_axis_from_smoke_test(preset_name, fie
         )
 
 
+def test_scale_100m_preset_constructs_near_100m_params():
+    """Standalone scale-up request (not a moe-modernization spec task):
+    ~100M params, built off BASELINE_V2's modernizations, for smoke-testing
+    the pipeline on a bigger (tiny_stories, char-level) dataset."""
+    import torch
+
+    from configs.presets import SCALE_100M
+    from qwenmoe.model.transformer import QwenMoEModel
+    from qwenmoe.train.scaling import count_params
+
+    assert SCALE_100M.d_model == 512
+    assert SCALE_100M.n_layers == 7
+    assert SCALE_100M.qk_norm is True
+    assert SCALE_100M.router_scoring == "sigmoid"
+
+    model = QwenMoEModel(SCALE_100M)
+    breakdown = count_params(model)
+    # measured ~104.7M total / ~38.6M active at this preset's vocab_size=91
+    assert 95_000_000 <= breakdown.total <= 115_000_000
+    assert breakdown.active < breakdown.total
+
+    ids = torch.randint(0, SCALE_100M.vocab_size, (2, 16))
+    logits, _ = model(ids)
+    assert logits.shape == (2, 16, SCALE_100M.vocab_size)
+    assert torch.isfinite(logits).all()
+
+
+def test_scale_300m_preset_constructs_near_300m_params():
+    """Follow-up hardware-capacity ask: ~300M params, empirically confirmed
+    (torch.mps peak-memory sweep) as the safe training ceiling on this
+    machine (M4 Pro, 24GB) at batch=16/seq=256 -- see repo memory notes."""
+    import torch
+
+    from configs.presets import SCALE_300M
+    from qwenmoe.model.transformer import QwenMoEModel
+    from qwenmoe.train.scaling import count_params
+
+    assert SCALE_300M.d_model == 768
+    assert SCALE_300M.n_layers == 10
+    assert SCALE_300M.qk_norm is True
+    assert SCALE_300M.router_scoring == "sigmoid"
+
+    model = QwenMoEModel(SCALE_300M)
+    breakdown = count_params(model)
+    # measured ~334.4M total / ~122.0M active at this preset's vocab_size=91
+    assert 310_000_000 <= breakdown.total <= 360_000_000
+    assert breakdown.active < breakdown.total
+
+    ids = torch.randint(0, SCALE_300M.vocab_size, (2, 16))
+    logits, _ = model(ids)
+    assert logits.shape == (2, 16, SCALE_300M.vocab_size)
+    assert torch.isfinite(logits).all()
+
+
 def test_moe_finegrained_preset_holds_ffn_params_constant():
     """moe-modernization task 17: MOE_FINEGRAINED changes granularity
     (more, smaller experts + higher top_k + more shared experts) while
