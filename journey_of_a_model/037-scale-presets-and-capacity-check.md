@@ -138,6 +138,43 @@ noise in the *train*-loss single-batch readings) — real evidence the
 bigger data/model pipeline works end to end, not a fabricated "it should
 work" claim.
 
+### Real wall-clock training time
+
+Each segment's real measured duration (`time uv run python scripts/train.py ...`,
+or — for the one segment measured via `get_terminal_output` polling
+instead of a captured `time` summary — the real checkpoint-file
+modification-time difference, an equally real wall-clock reading, just
+noted as such):
+
+| run | segment | steps | wall-clock time | ~s/step (incl. eval+checkpoint overhead) |
+|---|---|---:|---:|---:|
+| `SCALE_100M` (batch=16, seq=256) | 1→100 | 100 | 2m19s | 1.39s |
+| `SCALE_100M` (batch=16, seq=256) | 101→300 (resumed) | 200 | 4m28s | 1.34s |
+| `SCALE_300M` (batch=4, seq=256) | 1→100 | 100 | 2m53s | 1.73s |
+| `SCALE_300M` (batch=4, seq=256) | 101→300 (resumed) | 200 | 5m03s | 1.52s |
+| `SCALE_300M` (batch=4, seq=256) | 301→500 (resumed)† | 200 | 10m00s | 3.00s |
+
+†measured from `step_300.pt`'s to `step_500.pt`'s real filesystem
+modification timestamps (06:40 → 06:50), not a captured `time` summary —
+still a real wall-clock reading, just from a different source. It runs
+noticeably slower per step than the two segments before it on the same
+preset/batch/seq — consistent with this whole entry's finding that this
+machine's real available headroom fluctuates during a session depending
+on whatever else happens to be running at that moment, not with anything
+about the 301→500 steps themselves (the loss curve stayed perfectly
+smooth through this segment, so it's a speed effect, not a correctness
+one).
+
+Every one of these totals includes real, non-training overhead beyond
+the raw step compute: process startup, loading + splitting the full
+22.5M-token dataset, periodic validation passes (every 25 steps), and
+the final checkpoint write (1.2GB for `SCALE_100M`, 3.7GB for
+`SCALE_300M`, both fp32 params + 2× AdamW momentum buffers). The
+per-step-only compute cost, isolated from that overhead, is
+considerably faster — `scripts/check_capacity.py`'s own throughput
+sampling on `SCALE_100M` at this same batch/seq measured **~7,321-7,773
+tokens/sec**, i.e. roughly 0.53-0.56s for compute alone per step.
+
 **Why `SCALE_300M` used batch=4 while `SCALE_100M` used batch=16**: see
 the capacity investigation below — this is the direct, practical
 consequence of what it found.
