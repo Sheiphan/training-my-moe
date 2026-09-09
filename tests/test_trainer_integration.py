@@ -13,6 +13,7 @@ from qwenmoe.train.trainer import (
     Trainer,
     _evaluate,
     _forward_backward_step,
+    _run_step,
     _set_lr,
     lr_multiplier,
     select_device,
@@ -766,3 +767,164 @@ def test_forward_backward_step_segment_ids_none_matches_plain_cross_entropy():
         precision="fp32", z_loss_weight=0.0, segment_ids=None,
     )
     assert metrics["lm_loss"] == pytest.approx(ref, rel=1e-6)
+
+
+# -- Gradient accumulation (moe-modernization follow-up, journal 038) -------
+#
+# Lets a memory-constrained --batch-size still match a bigger run's
+# effective batch (batch_size * grad_accum_steps) at the peak memory cost
+# of batch_size alone -- the fix for comparing model sizes fairly when a
+# bigger model's memory footprint forces a smaller batch_size than a
+# smaller model's run used.
+
+
+def test_run_step_grad_accum_matches_a_single_bigger_batch():
+    """The core correctness property: accumulating `grad_accum_steps`
+    micro-batches into one optimizer step must produce (up to
+    floating-point noise) the SAME parameter update as running the whole
+    concatenated batch through in a single step -- that numerical
+    interchangeability, at a fraction of the peak memory, is the entire
+    point of the feature.
+
+    `aux_loss_weight=0.0` sidesteps the one way a real forward pass can
+    make the two paths diverge for a reason that has nothing to do with
+    gradient accumulation itself: `LossFreeBalancer`'s bias buffer mutates
+    after every training-mode forward call (`MoELayer.forward`), so two
+    micro-batch forwards would see a bias update between them that a single
+    big-batch forward never does. `AuxLossBalancer.update` is a documented
+    no-op, and multiplying its loss term by a weight of exactly 0.0 removes
+    it from both the loss value and the gradient without changing anything
+    else about the forward pass.
+    """
+    torch.manual_seed(0)
+    config = _tiny_model_config(aux_loss_weight=0.0)
+    reference_model = QwenMoEModel(config)
+    accum_model = QwenMoEModel(config)
+    accum_model.load_state_dict(reference_model.state_dict())
+
+    torch.manual_seed(1)
+    x = torch.randint(0, config.vocab_size, (8, 8))
+    y = torch.randint(0, config.vocab_size, (8, 8))
+
+    # warmup_steps=0 + total_steps=1 makes `_set_lr`'s cosine schedule apply
+    # a 1.0 multiplier at step 0 -- the same *unscaled* config.lr that
+    # `build_optimizer` stamps on directly, so `_run_step`'s internal
+    # `_set_lr` call doesn't introduce a warmup-driven LR mismatch against
+    # the reference path (which never calls `_set_lr` at all).
+    reference_config = TrainConfig(
+        batch_size=4, seq_len=8, total_tokens=1, device="cpu", warmup_steps=0, grad_clip_norm=1e6,
+    )
+    accum_config = TrainConfig(
+        batch_size=4, seq_len=8, total_tokens=1, device="cpu", warmup_steps=0, grad_clip_norm=1e6,
+        grad_accum_steps=2,
+    )
+    reference_optimizer = build_optimizer(reference_model, reference_config)
+    accum_optimizer = build_optimizer(accum_model, accum_config)
+
+    _forward_backward_step(
+        reference_model, reference_optimizer, x, y, grad_clip_norm=1e6, device="cpu"
+    )
+
+    micro_batches = [(x[:4], y[:4], None), (x[4:], y[4:], None)]
+    _run_step(accum_model, accum_optimizer, micro_batches, "cpu", 0, 1, accum_config)
+
+    for ref_p, accum_p in zip(reference_model.parameters(), accum_model.parameters()):
+        assert torch.allclose(ref_p, accum_p, atol=1e-5, rtol=1e-4)
+
+
+def test_trainer_grad_accum_reduces_optimizer_steps_for_the_same_token_budget(tmp_path):
+    """`total_steps` is driven by the *effective* batch (`batch_size *
+    grad_accum_steps`), not `batch_size` alone -- doubling
+    `grad_accum_steps` at a fixed `total_tokens` halves the number of
+    optimizer steps actually run, exactly like doubling `batch_size` would."""
+    torch.manual_seed(0)
+    config = _tiny_model_config()
+    train_ds, val_ds = _repeating_datasets()
+
+    plain = TrainConfig(
+        batch_size=8, seq_len=16, total_tokens=20 * 8 * 16,
+        checkpoint_interval_steps=20, eval_interval_steps=20, log_interval_steps=1,
+        device="cpu",
+    )
+    accumulated = TrainConfig(
+        batch_size=8, seq_len=16, total_tokens=20 * 8 * 16, grad_accum_steps=4,
+        checkpoint_interval_steps=20, eval_interval_steps=20, log_interval_steps=1,
+        device="cpu",
+    )
+
+    plain_result = Trainer(tmp_path / "plain").fit(QwenMoEModel(config), train_ds, val_ds, plain)
+    accum_result = Trainer(tmp_path / "accum").fit(
+        QwenMoEModel(config), train_ds, val_ds, accumulated
+    )
+
+    assert plain_result.final_step == 20
+    assert accum_result.final_step == 5  # same token budget, 4x the effective batch
+
+
+def test_trainer_grad_accum_expert_counts_sum_across_the_whole_window(tmp_path):
+    """Requirement 8.2's per-expert token counts must reflect the whole
+    accumulated effective batch, not just the last micro-batch --
+    generalizing `test_trainer_logs_per_expert_token_counts`'s invariant by
+    the extra `grad_accum_steps` factor."""
+    config = _tiny_model_config()
+    model = QwenMoEModel(config)
+    train_ds, val_ds = _repeating_datasets()
+    train_config = TrainConfig(
+        batch_size=8,
+        seq_len=16,
+        grad_accum_steps=3,
+        total_tokens=2 * 8 * 3 * 16,
+        checkpoint_interval_steps=2,
+        eval_interval_steps=2,
+        log_interval_steps=1,
+        device="cpu",
+    )
+
+    trainer = Trainer(tmp_path)
+    result = trainer.fit(model, train_ds, val_ds, train_config)
+
+    steps = [r for r in _read_jsonl(result.log_path) if r["type"] == "step"]
+    assert len(steps) == 2
+    counts = steps[0]["expert_token_counts"]
+    assert len(counts) == config.n_layers
+    for layer_counts in counts:
+        assert len(layer_counts) == config.n_routed_experts
+        assert sum(layer_counts) == (
+            config.top_k * train_config.batch_size * train_config.grad_accum_steps
+            * train_config.seq_len
+        )
+
+
+def test_trainer_grad_accum_runs_and_loss_decreases(tmp_path):
+    """End-to-end smoke test through the real `Trainer.fit` loop (not just
+    `_run_step` in isolation): a `grad_accum_steps > 1` run still trains --
+    finite, monotonically-improving loss -- exactly like a plain run."""
+    torch.manual_seed(0)
+    config = _tiny_model_config()
+    model = QwenMoEModel(config)
+    train_ds, val_ds = _repeating_datasets()
+    train_config = TrainConfig(
+        batch_size=4,
+        grad_accum_steps=2,
+        seq_len=16,
+        total_tokens=50 * 4 * 2 * 16,
+        lr=1e-2,
+        warmup_steps=5,
+        checkpoint_interval_steps=50,
+        eval_interval_steps=25,
+        log_interval_steps=1,
+        device="cpu",
+        seed=0,
+    )
+
+    result = Trainer(tmp_path).fit(model, train_ds, val_ds, train_config)
+
+    assert result.final_step == 50
+    assert math.isfinite(result.final_train_loss)
+
+    steps = [r for r in _read_jsonl(result.log_path) if r["type"] == "step"]
+    assert len(steps) == 50
+    early_mean = sum(r["train_loss"] for r in steps[:5]) / 5
+    late_mean = sum(r["train_loss"] for r in steps[-5:]) / 5
+    assert math.isfinite(early_mean) and math.isfinite(late_mean)
+    assert late_mean < early_mean

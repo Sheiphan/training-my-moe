@@ -85,6 +85,7 @@ def test_train_config_modernization_defaults():
     assert cfg.precision == "fp32"
     assert cfg.z_loss_weight == 0.0
     assert cfg.document_masking is False
+    assert cfg.grad_accum_steps == 1
 
 
 def test_data_config_val_split_mode_default():
@@ -146,6 +147,7 @@ def test_train_config_modernization_invalid_raise(overrides):
         {"eval_interval_steps": 0},
         {"max_eval_batches": 0},
         {"log_interval_steps": 0},
+        {"grad_accum_steps": 0},
     ],
 )
 def test_train_config_invalid_combinations_raise(overrides):

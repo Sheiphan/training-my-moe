@@ -8,7 +8,11 @@ document_masking` -- consumes `(x, y, segment_ids)` batches from a
 `cpu`), periodic console + JSON-lines logging of per-step metrics (now
 including gradient norm and z-loss) and per-expert token counts (consumed
 later by the training-observability scenes, task 14), periodic validation
-loss/perplexity, and checkpoint save/resume.
+loss/perplexity, checkpoint save/resume, and gradient accumulation
+(`TrainConfig.grad_accum_steps` -- journal 038: an effective batch of
+`batch_size * grad_accum_steps` at the peak memory cost of just
+`batch_size`, so a memory-constrained model size can still be trained at
+the same effective batch as a smaller model it's being compared against).
 """
 from __future__ import annotations
 
@@ -169,22 +173,33 @@ def _collect_expert_counts(model: QwenMoEModel) -> list[list[int]]:
     return [block.moe.last_expert_counts.tolist() for block in model.blocks]
 
 
-def _forward_backward_step(
+def _forward_backward_core(
     model: QwenMoEModel,
-    optimizer: torch.optim.Optimizer,
     x: torch.Tensor,
     y: torch.Tensor,
-    grad_clip_norm: float,
-    device: str = "cpu",
-    precision: Literal["fp32", "bf16"] = "fp32",
-    z_loss_weight: float = 0.0,
-    segment_ids: torch.Tensor | None = None,
-) -> tuple[dict, float]:
-    """One optimizer step. Returns `(metrics, grad_norm)` where `metrics` is
-    a dict of Python floats (or `None` / `list[float]`) with keys
+    device: str,
+    precision: Literal["fp32", "bf16"],
+    z_loss_weight: float,
+    segment_ids: torch.Tensor | None,
+    loss_scale: float,
+) -> dict:
+    """Forward pass + `(loss_scale * total_loss).backward()` for ONE
+    micro-batch -- the piece shared by `_forward_backward_step` (a full
+    optimizer step, `loss_scale=1.0`, called once) and gradient
+    accumulation's `_run_step` (`loss_scale = 1/grad_accum_steps`, called
+    `grad_accum_steps` times per optimizer step with gradients accumulating
+    across calls -- zero_grad/clip/optimizer.step() are the *caller's*
+    responsibility, not this function's, since they bracket the whole
+    accumulation window rather than one micro-batch).
+
+    Returns a dict of Python floats (or `None` / `list[float]`) with keys
     `lm_loss`, `aux_loss`, `z_loss`, `mtp_loss`, `mtp_losses` -- each `None`
     when that term is inactive (no balancer, `z_loss_weight == 0`,
-    `mtp_depth == 0`), mirroring how `aux_loss` was already `None`-able.
+    `mtp_depth == 0`). These are always the *unscaled* per-token loss
+    values -- `loss_scale` only rescales the backward pass so accumulated
+    gradients average correctly over the effective batch; it never changes
+    what's reported (averaging *reported* losses across micro-batches is
+    `_average_metrics`'s job, not this function's).
 
     Precision (Requirement 3.1, 3.2): with `precision == "bf16"` the forward
     pass runs under `torch.autocast(bfloat16)` -- matmuls drop to bf16 while
@@ -208,9 +223,6 @@ def _forward_backward_step(
     `None` (the trainer passes it only when `TrainConfig.document_masking`)
     -> forward byte-identical to before this task (Requirement 10.3).
     """
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
-
     autocast_ctx: contextlib.AbstractContextManager = (
         torch.autocast(device_type=device, dtype=torch.bfloat16)
         if precision == "bf16"
@@ -246,59 +258,161 @@ def _forward_backward_step(
         mtp_loss = mtp_mean.item()
         mtp_losses = [t.item() for t in extras["mtp_losses"]]
 
-    total_loss.backward()
-    # Returns the *pre-clip* global norm (Requirement 1.3) -- clip_grad_norm_
-    # computes it before rescaling, so this doubles as a training-health
-    # signal: a rising norm here typically precedes a loss spike.
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-    optimizer.step()
-    metrics = {
+    (total_loss * loss_scale).backward()
+    return {
         "lm_loss": loss.item(),
         "aux_loss": aux_loss.item() if aux_loss is not None else None,
         "z_loss": z_loss,
         "mtp_loss": mtp_loss,
         "mtp_losses": mtp_losses,
     }
+
+
+def _forward_backward_step(
+    model: QwenMoEModel,
+    optimizer: torch.optim.Optimizer,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    grad_clip_norm: float,
+    device: str = "cpu",
+    precision: Literal["fp32", "bf16"] = "fp32",
+    z_loss_weight: float = 0.0,
+    segment_ids: torch.Tensor | None = None,
+) -> tuple[dict, float]:
+    """One full optimizer step on a single micro-batch (the
+    `grad_accum_steps == 1` case -- gradient accumulation's multi-micro-batch
+    path lives in `_run_step`, which calls `_forward_backward_core` directly
+    instead of this wrapper). Returns `(metrics, grad_norm)` -- see
+    `_forward_backward_core` for what `metrics` contains and how precision/
+    MTP/document-masking are handled.
+    """
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    metrics = _forward_backward_core(
+        model, x, y, device, precision, z_loss_weight, segment_ids, loss_scale=1.0
+    )
+    # Returns the *pre-clip* global norm (Requirement 1.3) -- clip_grad_norm_
+    # computes it before rescaling, so this doubles as a training-health
+    # signal: a rising norm here typically precedes a loss spike.
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+    optimizer.step()
     return metrics, float(grad_norm)
+
+
+def _average_metrics(metrics_list: list[dict]) -> dict:
+    """Means each numeric field across accumulated micro-batches' metrics
+    dicts (as produced by `_forward_backward_core`) -- e.g. `lm_loss`
+    becomes the mean per-token loss over the whole accumulation window,
+    matching what it would have been had the micro-batches been one real
+    batch. `None`-valued fields (an inactive loss term) are skipped rather
+    than treated as 0, and stay `None` if every micro-batch had `None`.
+    `mtp_losses` (a list, one entry per MTP depth) is averaged elementwise.
+
+    With a single-element `metrics_list` (`grad_accum_steps == 1`, the
+    default) this is the identity on that one dict -- every existing
+    single-micro-batch test's exact values are unaffected.
+    """
+
+    def _mean(key: str) -> float | None:
+        values = [m[key] for m in metrics_list if m[key] is not None]
+        return sum(values) / len(values) if values else None
+
+    mtp_losses_lists = [m["mtp_losses"] for m in metrics_list if m["mtp_losses"] is not None]
+    mtp_losses = (
+        [sum(depth_losses) / len(depth_losses) for depth_losses in zip(*mtp_losses_lists)]
+        if mtp_losses_lists
+        else None
+    )
+
+    return {
+        "lm_loss": _mean("lm_loss"),
+        "aux_loss": _mean("aux_loss"),
+        "z_loss": _mean("z_loss"),
+        "mtp_loss": _mean("mtp_loss"),
+        "mtp_losses": mtp_losses,
+    }
+
+
+def _sum_expert_counts(per_microbatch: list[list[list[int]]]) -> list[list[int]]:
+    """Elementwise-sums `_collect_expert_counts` readings taken after each
+    micro-batch in an accumulation window, so the logged per-expert token
+    counts reflect the *whole* effective batch rather than just the last
+    micro-batch (`MoELayer.last_expert_counts` is overwritten by every
+    forward call). With one micro-batch (`grad_accum_steps == 1`) this is
+    the identity on that single reading.
+    """
+    n_layers = len(per_microbatch[0])
+    return [
+        [sum(counts[layer_idx][expert_idx] for counts in per_microbatch)
+         for expert_idx in range(len(per_microbatch[0][layer_idx]))]
+        for layer_idx in range(n_layers)
+    ]
 
 
 def _run_step(
     model: QwenMoEModel,
     optimizer: torch.optim.Optimizer,
-    x: torch.Tensor,
-    y: torch.Tensor,
+    micro_batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]],
     device: str,
     step: int,
     total_steps: int,
     config: TrainConfig,
-    segment_ids: torch.Tensor | None = None,
-) -> tuple[dict, float, float, str, QwenMoEModel]:
-    """Runs one training step, falling back to `cpu` if a real `RuntimeError`
-    hits mid-step on `mps` (design.md Error Handling: "MPS unavailable/errors
-    during a step -> fall back to cpu with a logged warning, never a hard
-    crash", Requirement 3.2 -- this also catches a backend that can't run the
-    bf16 autocast path). Returns `(metrics, grad_norm, current_lr, device,
-    model)` -- the (possibly updated) `device`/`model` so the caller keeps
-    using them for subsequent steps.
+) -> tuple[dict, float, float, str, QwenMoEModel, list[list[int]]]:
+    """Runs one *optimizer* step, accumulating gradients over every
+    `(x, y, segment_ids)` triple in `micro_batches` (moe-modernization
+    follow-up, journal 038: gradient accumulation) before a single clip +
+    `optimizer.step()`. `len(micro_batches) == 1` (`config.grad_accum_steps
+    == 1`, the default) reduces to exactly the old one-micro-batch-per-step
+    behavior (`loss_scale=1.0`, a single `_forward_backward_core` call), so
+    every pre-existing call site and test is unaffected.
+
+    Falls back to `cpu` if a real `RuntimeError` hits mid-window on `mps`
+    (design.md Error Handling: "MPS unavailable/errors during a step -> fall
+    back to cpu with a logged warning, never a hard crash", Requirement 3.2
+    -- this also catches a backend that can't run the bf16 autocast path).
+    On fallback the *whole* accumulation window is restarted from a fresh
+    zero_grad on cpu rather than resumed partway through -- simpler than
+    threading "which micro-batch failed" through the retry, and just as
+    correct given how rare this path is (a warned, not silent, fallback).
+
+    Returns `(metrics, grad_norm, current_lr, device, model, expert_counts)`
+    -- the (possibly updated) `device`/`model` so the caller keeps using
+    them for subsequent steps, `metrics` averaged across the window
+    (`_average_metrics`), and `expert_counts` summed across it
+    (`_sum_expert_counts`) so it reflects the whole effective batch, not
+    just the last micro-batch.
 
     `segment_ids` (moe-modernization Requirement 10.2) is moved to `device`
     alongside `x`/`y` and passed through for document masking; `None` when
     `TrainConfig.document_masking` is off.
     """
     current_lr = _set_lr(optimizer, config.lr, step, total_steps, config)
-    seg = segment_ids.to(device) if segment_ids is not None else None
+    loss_scale = 1.0 / len(micro_batches)
+
+    def _accumulate(device: str) -> tuple[list[dict], list[list[list[int]]]]:
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        step_metrics = []
+        expert_counts_per_microbatch = []
+        for x, y, segment_ids in micro_batches:
+            seg = segment_ids.to(device) if segment_ids is not None else None
+            step_metrics.append(
+                _forward_backward_core(
+                    model,
+                    x.to(device),
+                    y.to(device),
+                    device,
+                    config.precision,
+                    config.z_loss_weight,
+                    seg,
+                    loss_scale,
+                )
+            )
+            expert_counts_per_microbatch.append(_collect_expert_counts(model))
+        return step_metrics, expert_counts_per_microbatch
+
     try:
-        metrics, grad_norm = _forward_backward_step(
-            model,
-            optimizer,
-            x.to(device),
-            y.to(device),
-            config.grad_clip_norm,
-            device,
-            config.precision,
-            config.z_loss_weight,
-            seg,
-        )
+        step_metrics, expert_counts_per_microbatch = _accumulate(device)
     except RuntimeError as exc:
         if device != "mps":
             raise
@@ -310,19 +424,16 @@ def _run_step(
         model = model.to("cpu")
         _move_optimizer_state_to_device(optimizer, "cpu")
         device = "cpu"
-        seg = segment_ids.to(device) if segment_ids is not None else None
-        metrics, grad_norm = _forward_backward_step(
-            model,
-            optimizer,
-            x.to(device),
-            y.to(device),
-            config.grad_clip_norm,
-            device,
-            config.precision,
-            config.z_loss_weight,
-            seg,
-        )
-    return metrics, grad_norm, current_lr, device, model
+        step_metrics, expert_counts_per_microbatch = _accumulate(device)
+
+    # Returns the *pre-clip* global norm (Requirement 1.3) -- clip_grad_norm_
+    # computes it before rescaling, so this doubles as a training-health
+    # signal: a rising norm here typically precedes a loss spike.
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
+    optimizer.step()
+    metrics = _average_metrics(step_metrics)
+    expert_counts = _sum_expert_counts(expert_counts_per_microbatch)
+    return metrics, float(grad_norm), current_lr, device, model, expert_counts
 
 
 def _evaluate(
@@ -462,7 +573,13 @@ class Trainer:
             _move_optimizer_state_to_device(optimizer, device)
             global_step = checkpoint["step"]
 
-        total_steps = max(1, config.total_tokens // (config.batch_size * config.seq_len))
+        # Gradient accumulation (moe-modernization follow-up, journal 038):
+        # each optimizer step consumes `grad_accum_steps` micro-batches, so
+        # the *effective* batch that sets step count is `batch_size *
+        # grad_accum_steps`, not `batch_size` alone. `grad_accum_steps == 1`
+        # (the default) reduces this to the pre-existing formula exactly.
+        effective_batch_size = config.batch_size * config.grad_accum_steps
+        total_steps = max(1, config.total_tokens // (effective_batch_size * config.seq_len))
 
         train_loader = DataLoader(
             train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True
@@ -482,23 +599,30 @@ class Trainer:
 
         with self.log_path.open("a", encoding="utf-8") as log_file:
             while global_step < total_steps:
-                batch = next(train_iter)
-                x, y = batch[0], batch[1]
-                # (x, y, segment_ids) from a return_segments dataset -- only
-                # consumed when document masking is on (Requirement 10.2/10.3).
-                segment_ids = batch[2] if (config.document_masking and len(batch) == 3) else None
+                # One optimizer step consumes `grad_accum_steps` micro-batches
+                # (moe-modernization follow-up, journal 038); with the default
+                # of 1 this is exactly the old single-batch-per-step pull.
+                micro_batches = []
+                for _ in range(config.grad_accum_steps):
+                    batch = next(train_iter)
+                    x, y = batch[0], batch[1]
+                    # (x, y, segment_ids) from a return_segments dataset --
+                    # only consumed when document masking is on (Requirement
+                    # 10.2/10.3).
+                    segment_ids = (
+                        batch[2] if (config.document_masking and len(batch) == 3) else None
+                    )
+                    micro_batches.append((x, y, segment_ids))
 
                 step_start = time.perf_counter()
-                metrics, grad_norm, current_lr, device, model = _run_step(
+                metrics, grad_norm, current_lr, device, model, expert_counts = _run_step(
                     model,
                     optimizer,
-                    x,
-                    y,
+                    micro_batches,
                     device,
                     global_step,
                     total_steps,
                     config,
-                    segment_ids,
                 )
                 elapsed = time.perf_counter() - step_start
 
@@ -534,7 +658,10 @@ class Trainer:
                             "lr": current_lr,
                             "grad_norm": grad_norm,
                             "elapsed_s": elapsed,
-                            "expert_token_counts": _collect_expert_counts(model),
+                            # Summed across the accumulation window by
+                            # `_run_step` (`_sum_expert_counts`), not just the
+                            # last micro-batch's reading.
+                            "expert_token_counts": expert_counts,
                         },
                     )
 

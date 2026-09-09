@@ -7,6 +7,11 @@ Usage (tiny-Shakespeare smoke test):
     uv run python scripts/prepare_data.py --corpus tiny_shakespeare --tokenizer-type char
     uv run python scripts/train.py --preset SMOKE_TEST --corpus tiny_shakespeare \\
         --tokenizer-type char --total-tokens 200000 --output-dir runs/smoke_test
+
+Usage (gradient accumulation -- match a bigger model's memory-constrained
+--batch-size to a smaller model's effective batch, journal 038):
+    uv run python scripts/train.py --preset SCALE_300M --batch-size 4 \\
+        --grad-accum-steps 4 ... # effective batch 16, same peak memory as batch=4 alone
 """
 from __future__ import annotations
 
@@ -72,6 +77,15 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--total-tokens", type=int, required=True, help="training token budget")
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="micro-batches of --batch-size accumulated per optimizer step -- an "
+        "effective batch of batch-size * grad-accum-steps at the peak memory cost "
+        "of just batch-size (journal 038; lets a memory-constrained --batch-size "
+        "still match a bigger run's effective batch for a fair comparison)",
+    )
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=200)
@@ -129,6 +143,7 @@ def main() -> None:
 
     train_config = TrainConfig(
         batch_size=args.batch_size,
+        grad_accum_steps=args.grad_accum_steps,
         seq_len=args.seq_len,
         total_tokens=args.total_tokens,
         lr=args.lr,
@@ -167,6 +182,13 @@ def main() -> None:
         len(train_tokens),
         len(val_tokens),
     )
+    if args.grad_accum_steps > 1:
+        logger.info(
+            "gradient accumulation: batch_size=%d x grad_accum_steps=%d -> effective batch %d",
+            args.batch_size,
+            args.grad_accum_steps,
+            args.batch_size * args.grad_accum_steps,
+        )
 
     trainer = Trainer(args.output_dir, tokenizer_meta=tokenizer_meta)
     result = trainer.fit(model, train_dataset, val_dataset, train_config, resume_from=args.resume_from)

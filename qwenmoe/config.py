@@ -138,6 +138,14 @@ class TrainConfig:
     # Data (Requirement 10)
     document_masking: bool = False
 
+    # Gradient accumulation (moe-modernization follow-up, journal 038):
+    # `grad_accum_steps` micro-batches of `batch_size` each are forward/backward'd
+    # before a single optimizer.step(), simulating an effective batch of
+    # `batch_size * grad_accum_steps` at the peak memory cost of just `batch_size`
+    # -- the fix for comparing model sizes fairly when a bigger model's memory
+    # footprint forces a smaller `batch_size` than a smaller model's run used.
+    grad_accum_steps: int = 1
+
     def __post_init__(self) -> None:
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
@@ -177,6 +185,8 @@ class TrainConfig:
             raise ValueError(f"decay_fraction must be in (0, 1], got {self.decay_fraction}")
         if self.z_loss_weight < 0:
             raise ValueError(f"z_loss_weight must be >= 0, got {self.z_loss_weight}")
+        if self.grad_accum_steps < 1:
+            raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
 
 
 @dataclass
