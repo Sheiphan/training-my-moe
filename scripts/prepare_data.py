@@ -7,6 +7,8 @@ Usage:
     uv run python scripts/prepare_data.py --corpus tiny_shakespeare --tokenizer-type char
     uv run python scripts/prepare_data.py --corpus tiny_stories --tokenizer-type bpe \\
         --bpe-vocab-size 4096 --split-documents
+    uv run python scripts/prepare_data.py --corpus fineweb_edu --tokenizer-type bpe \\
+        --bpe-vocab-size 4096 --split-documents
 """
 from __future__ import annotations
 
@@ -101,7 +103,9 @@ def prepare_data(config: DataConfig, *, document_aware: bool = False) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--corpus", choices=["tiny_shakespeare", "tiny_stories"], default="tiny_shakespeare"
+        "--corpus",
+        choices=["tiny_shakespeare", "tiny_stories", "fineweb_edu"],
+        default="tiny_shakespeare",
     )
     parser.add_argument("--tokenizer-type", choices=["char", "bpe"], default="char")
     parser.add_argument("--bpe-vocab-size", type=int, default=4096)

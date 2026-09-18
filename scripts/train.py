@@ -12,6 +12,14 @@ Usage (gradient accumulation -- match a bigger model's memory-constrained
 --batch-size to a smaller model's effective batch, journal 038):
     uv run python scripts/train.py --preset SCALE_300M --batch-size 4 \\
         --grad-accum-steps 4 ... # effective batch 16, same peak memory as batch=4 alone
+
+Usage (fineweb_edu -- real, diverse web text instead of tiny_stories'
+synthetic children's stories, journal 039):
+    uv run python scripts/prepare_data.py --corpus fineweb_edu --tokenizer-type bpe \\
+        --bpe-vocab-size 4096 --split-documents
+    uv run python scripts/train.py --preset SCALE_300M --corpus fineweb_edu \\
+        --tokenizer-type bpe --bpe-vocab-size 4096 --total-tokens 200000000 \\
+        --output-dir runs/fineweb_300m
 """
 from __future__ import annotations
 
@@ -69,7 +77,9 @@ def main() -> None:
         "--preset", default="BASELINE", help="ModelConfig preset name from configs/presets.py"
     )
     parser.add_argument(
-        "--corpus", choices=["tiny_shakespeare", "tiny_stories"], default="tiny_shakespeare"
+        "--corpus",
+        choices=["tiny_shakespeare", "tiny_stories", "fineweb_edu"],
+        default="tiny_shakespeare",
     )
     parser.add_argument("--tokenizer-type", choices=["char", "bpe"], default="char")
     parser.add_argument("--bpe-vocab-size", type=int, default=4096)

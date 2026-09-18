@@ -191,7 +191,7 @@ class TrainConfig:
 
 @dataclass
 class DataConfig:
-    corpus: Literal["tiny_shakespeare", "tiny_stories"]
+    corpus: Literal["tiny_shakespeare", "tiny_stories", "fineweb_edu"]
     tokenizer_type: Literal["char", "bpe"]
     bpe_vocab_size: int = 4096
     cache_dir: Path = Path(".cache/data")

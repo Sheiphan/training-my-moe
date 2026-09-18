@@ -8,6 +8,7 @@ dependencies = [
     "huggingface-hub>=1.29.0",
     "jupyter>=1.1.1",
     "manim>=0.21.0",
+    "pyarrow>=25.0.1",
     "torch>=2.13.0",
 ]
 

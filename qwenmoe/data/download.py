@@ -13,13 +13,24 @@ mix) validation split, ~22.5MB, small enough to download and to run this
 project's from-scratch `ByteBPETokenizer` merge-learning loop over in
 reasonable time on a laptop. See the task-8 journal entry for the full
 file-choice rationale.
+
+`fineweb_edu` trades TinyStories' narrow, synthetic, children's-story
+domain for real, diverse, quality-filtered web text — see the journal-039
+entry for the dataset comparison and the scaling-law sizing behind the
+~400M-character target. FineWeb-Edu (Penedo et al., 2024,
+https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu, odc-by license)
+ships only as parquet, so this path needs `pyarrow` (already a project
+dependency) to read the `text` column; there's no plain-text release to
+avoid it with, unlike TinyStories.
 """
 from __future__ import annotations
 
+import unicodedata
 import urllib.request
 from pathlib import Path
 from typing import Literal
 
+import pyarrow.parquet as pq
 from huggingface_hub import hf_hub_download
 
 from qwenmoe.config import DataConfig
@@ -31,8 +42,90 @@ _TINY_STORIES_REPO_ID = "roneneldan/TinyStories"
 _TINY_STORIES_FILENAME = "TinyStoriesV2-GPT4-valid.txt"
 _DOWNLOAD_TIMEOUT_SECONDS = 30
 
+_FINEWEB_EDU_REPO_ID = "HuggingFaceFW/fineweb-edu"
+# The smallest official FineWeb-Edu release is the 10B-token "sample-10BT"
+# split across 14 shards of ~2.15GB each (~700M tokens/shard); one shard is
+# already far more raw material than this project needs, so only the first
+# is ever downloaded.
+_FINEWEB_EDU_SHARD_FILENAME = "sample/10BT/000_00000.parquet"
+# ~18x tiny_stories' ~22.5M characters, chosen so that even a full
+# Chinchilla-optimal training budget for this repo's biggest preset
+# (SCALE_300M, ~122M active params -> chinchilla_budget ~= 2.44B tokens,
+# see qwenmoe/train/scaling.py) stays under ~6 epochs over this corpus, and
+# a realistic laptop-scale run (tens to a few hundred million tokens,
+# journal-037's measured wall-clock budget) stays under 1 epoch --
+# comfortably below epochs_for_budget's 4-epoch repetition warning either
+# way. Also sized to keep char-tokenizer encoding's peak memory (a Python
+# str + an int list + a torch.long tensor of this many elements) well clear
+# of the ~24GB unified-memory swap cliff journal-037 measured on this
+# machine.
+_FINEWEB_EDU_TARGET_CHARS = 400_000_000
 
-def download_corpus(name: Literal["tiny_shakespeare", "tiny_stories"], cache_dir: str | Path) -> Path:
+# A raw sample of FineWeb-Edu documents (empirically checked, journal-039)
+# pulls in a long tail of foreign-script/symbol/emoji characters from
+# incidental non-English content: even filtering out documents that are
+# *mostly* non-ASCII still left ~3700 distinct characters over a 400M-
+# character sample, most appearing so rarely their embedding rows would
+# barely ever get a gradient -- and CharTokenizer.encode raises on any
+# character outside the trained vocab, so a fatter tail is also a more
+# fragile tokenizer (ByteBPETokenizer has no such failure mode: it falls
+# back to raw bytes). `_to_ascii` folds common typographic punctuation and
+# accented letters to their plain-ASCII equivalents (so "café"/"naïve"
+# survive as "cafe"/"naive", and smart quotes/em-dashes survive as their
+# straight/hyphen forms) and drops anything left over (CJK, Cyrillic,
+# emoji, symbols) character by character, matching how tiny_stories/
+# tiny_shakespeare's char vocabs stay in the ~60-90 range.
+_TYPOGRAPHIC_ASCII_MAP = str.maketrans(
+    {
+        "‘": "'", "’": "'",  # ‘ ’
+        "“": '"', "”": '"',  # “ ”
+        "–": "-", "—": "-",  # – —
+        "…": "...",  # …
+        "\xa0": " ",  # non-breaking space
+    }
+)
+
+# A document that's mostly a different script turns into near-nothing once
+# ASCII-folded; skip it rather than spend the character budget on the
+# handful of stray Latin characters (page furniture, numbers) left behind.
+_FINEWEB_EDU_MIN_RETAINED_FRACTION = 0.8
+
+
+def _to_ascii(text: str) -> str:
+    text = text.translate(_TYPOGRAPHIC_ASCII_MAP)
+    text = unicodedata.normalize("NFKD", text)
+    return text.encode("ascii", "ignore").decode("ascii")
+
+
+def _extract_fineweb_edu_text(shard_path: Path, target_chars: int) -> str:
+    """Reads `shard_path`'s `text` column row-group by row-group,
+    ASCII-folding each document (`_to_ascii`) and keeping it only if that
+    didn't hollow it out, stopping as soon as `target_chars` characters
+    have been accumulated -- so a ~2.15GB shard is never fully
+    materialized in memory just to keep a filtered fraction of it."""
+    parquet_file = pq.ParquetFile(shard_path)
+    documents: list[str] = []
+    total_chars = 0
+    for batch in parquet_file.iter_batches(columns=["text"]):
+        for text in batch.column("text").to_pylist():
+            ascii_text = _to_ascii(text)
+            if len(ascii_text) < _FINEWEB_EDU_MIN_RETAINED_FRACTION * len(text):
+                continue
+            documents.append(ascii_text)
+            total_chars += len(ascii_text)
+            if total_chars >= target_chars:
+                return _DOCUMENT_SEPARATOR.join(documents)
+    return _DOCUMENT_SEPARATOR.join(documents)
+
+
+# Matches scripts/prepare_data.py's own document separator so
+# --split-documents works on this corpus exactly like tiny_stories.
+_DOCUMENT_SEPARATOR = "<|endoftext|>"
+
+
+def download_corpus(
+    name: Literal["tiny_shakespeare", "tiny_stories", "fineweb_edu"], cache_dir: str | Path
+) -> Path:
     """Downloads (if not already cached) `name`'s raw text corpus under
     `cache_dir`, and returns the local path to the cached text file."""
     cache_dir = Path(cache_dir)
@@ -55,6 +148,19 @@ def download_corpus(name: Literal["tiny_shakespeare", "tiny_stories"], cache_dir
             cache_dir=cache_dir,
         )
         return Path(path)
+
+    if name == "fineweb_edu":
+        dest = cache_dir / "fineweb_edu_sample.txt"
+        if not dest.exists():
+            shard_path = hf_hub_download(
+                repo_id=_FINEWEB_EDU_REPO_ID,
+                filename=_FINEWEB_EDU_SHARD_FILENAME,
+                repo_type="dataset",
+                cache_dir=cache_dir,
+            )
+            text = _extract_fineweb_edu_text(Path(shard_path), _FINEWEB_EDU_TARGET_CHARS)
+            dest.write_text(text, encoding="utf-8")
+        return dest
 
     raise ValueError(f"Unknown corpus: {name!r}")
 

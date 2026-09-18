@@ -2,9 +2,15 @@ import pytest
 
 from qwenmoe.config import DataConfig
 from qwenmoe.tokenizer.base import Tokenizer, build_tokenizer
-from qwenmoe.tokenizer.bpe import ByteBPETokenizer
+from qwenmoe.tokenizer.bpe import _PRE_TOKEN_PATTERN, ByteBPETokenizer
 
 CORPUS = "the quick brown fox jumps over the lazy dog. " * 40
+
+# Every class of character the pre-tokenizer has to place in some chunk:
+# underscores (which Python's `\w` counts as a word character, unlike
+# GPT-2's `\p{L}`/`\p{N}`), symbols, digits, contractions, newlines, tabs
+# and non-Latin text.
+AWKWARD_TEXT = "file_name.py\tsnake_case x=1+2 don't 100% <tag> café 你好\n\nend_"
 
 
 def test_train_reaches_configured_target_vocab_size():
@@ -28,6 +34,26 @@ def test_round_trip_lossless_for_unseen_unicode_text():
     tok.train(CORPUS)
     unseen = "héllo wörld 你好 🎉"
     assert tok.decode(tok.encode(unseen)) == unseen
+
+
+def test_pre_tokenization_covers_every_character():
+    """`finditer` silently skips text no alternative matches, so any gap in
+    the pattern deletes characters from the corpus. The chunks must
+    reassemble into exactly the input."""
+    chunks = [m.group() for m in _PRE_TOKEN_PATTERN.finditer(AWKWARD_TEXT)]
+    assert "".join(chunks) == AWKWARD_TEXT
+
+
+def test_round_trip_lossless_for_awkward_text():
+    tok = ByteBPETokenizer(target_vocab_size=300)
+    tok.train(CORPUS)
+    assert tok.decode(tok.encode(AWKWARD_TEXT)) == AWKWARD_TEXT
+
+
+def test_round_trip_lossless_when_trained_on_awkward_text():
+    tok = ByteBPETokenizer(target_vocab_size=300)
+    tok.train(AWKWARD_TEXT * 20)
+    assert tok.decode(tok.encode(AWKWARD_TEXT)) == AWKWARD_TEXT
 
 
 def test_encode_compresses_relative_to_raw_bytes():
