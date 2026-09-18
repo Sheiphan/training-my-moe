@@ -3,6 +3,12 @@
 **Type:** task · **Date:** 2026-08-31 · **Related:** Requirements 1.5, 1.6,
 9.3, 12.1; design.md `model/attention.py` component
 
+> **Full by-hand derivation:** [`docs/math/004-attention-gqa.md`](../docs/math/004-attention-gqa.md)
+> carries one concrete 3-token, 2-head, 1-KV-head example through *every*
+> line of `Attention.forward_with_trace` — each projection, reshape,
+> rotation, mask and softmax solved digit by digit and checked against the
+> real module by [`docs/math/verify_004_attention_gqa.py`](../docs/math/verify_004_attention_gqa.py).
+
 ## What was implemented
 - `qwenmoe/model/attention.py::build_positional_scheme(config, head_dim)` —
   the factory deferred from task 3, constructing whichever positional

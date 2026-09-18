@@ -3,6 +3,15 @@
 **Type:** task · **Date:** 2026-08-31 · **Related:** Requirements 4.2, 4.3;
 design.md `tokenizer/` component
 
+> **Full by-hand derivation:** [`docs/math/007-tokenizers.md`](../docs/math/007-tokenizers.md)
+> carries one concrete corpus (`"aaacaaacabab"`, `target_vocab_size=262`)
+> through *every* line of `ByteBPETokenizer.train` / `.encode` / `.decode`
+> / `.save` / `.load` — UTF-8 encoding, pair counting, the scan-order
+> tie-breaks, the frequency-2 gate, non-overlapping merges, the early
+> stop, priority-ordered replay, `errors="replace"`, and the reserved
+> `<eos>` id — solved digit by digit and checked against the real module
+> by [`docs/math/verify_007_tokenizers.py`](../docs/math/verify_007_tokenizers.py).
+
 ## What was implemented
 - `qwenmoe/tokenizer/char.py::CharTokenizer` — vocab = every unique
   character seen during `train()`, sorted for a deterministic id

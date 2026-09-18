@@ -3,6 +3,18 @@
 **Type:** tooling + experiment (follow-up to [034](034-modernized-presets.md) / [035](035-modernized-presets-training-run.md), not a spec task)
 **Date:** 2026-09-05
 
+> **Full by-hand derivation (of `attn_logit_std`/`spread`, i.e. the
+> "range across depth" metric only — QK-norm itself is doc 022's job):**
+> [`docs/math/036-attention-logit-spread.md`](../docs/math/036-attention-logit-spread.md)
+> derives `Tensor.std()`'s flatten-then-Bessel-corrected formula from
+> scratch on the real 18-entry population, proves the exact `std(cZ) =
+> c·std(Z)` homogeneity that makes an un-normed layer's spread grow by
+> precisely `c²` while a QK-normed layer's stays pinned to a `4.5e-7`
+> residue, and reproduces this entry's own **23× smaller range** headline
+> by re-tracing the real `BASELINE`/`BASELINE_V2` checkpoints, checked
+> against the real module by
+> [`docs/math/verify_036_attention_logit_spread.py`](../docs/math/verify_036_attention_logit_spread.py).
+
 ## TL;DR
 
 - The project's two interactive HTML visualizations were both **stale**: they only knew the pre-`moe-modernization` architecture. `ablation_study/` shipped data for 8 axes while `scripts/run_ablation_study.py` had listed **14** since entry [033](033-ablation-menu-and-moe-budget-note.md) — the six modernization axes had *never been trained*. `token_journey/` walked four `SMOKE_TEST`-derived checkpoints and had no idea QK-norm or sigmoid routing existed.

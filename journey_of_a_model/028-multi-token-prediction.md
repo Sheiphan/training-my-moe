@@ -4,6 +4,8 @@
 Requirement 6.1-6.5; `design.md` `model/mtp.py` + `model/transformer.py`
 components
 
+> **Full derivation:** [`docs/math/028-multi-token-prediction.md`](../docs/math/028-multi-token-prediction.md) works `MTPHead.forward` and the causal chain line by line, by hand, on a fully-worked 3-token GQA example (depth 2 consuming depth 1's own output), verified against the real modules.
+
 ## What was implemented
 
 - **`qwenmoe/model/mtp.py::MTPHead`** — one *optional*, *training-only*

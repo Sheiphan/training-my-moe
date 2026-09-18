@@ -4,6 +4,12 @@
 Requirement 11.1-11.4; `design.md` `model/generate.py` component;
 follows up entry 015 (temperature / top-k / top-p sampling)
 
+> **Full derivation, solved by hand:** [`docs/math/030-min-p-and-repetition-penalty.md`](../docs/math/030-min-p-and-repetition-penalty.md)
+> — the sign-aware penalty and the `min_p·p_max` threshold traced line by
+> line on one worked example, including a closed-form proof of *why* min-p
+> is adaptive, and the penalty run against this project's own real
+> `"DADDDD"` degeneration.
+
 ## What was implemented
 
 - **`filter_min_p(logits, min_p)`** in `qwenmoe/model/generate.py` — mirrors

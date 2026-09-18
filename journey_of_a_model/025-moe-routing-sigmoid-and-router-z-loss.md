@@ -4,6 +4,8 @@
 Requirement 4.1, 4.2, 4.3, 4.5, 4.6; `design.md` `model/moe.py` component;
 follows up entries 006 (the router) and 016 (loss-free balancing)
 
+> **Full derivation, solved by hand:** [`docs/math/025-moe-routing-sigmoid-and-router-z-loss.md`](../docs/math/025-moe-routing-sigmoid-and-router-z-loss.md).
+
 ## What was implemented
 
 All three knobs default to the pre-spec path, so a config written before

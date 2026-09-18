@@ -5,6 +5,19 @@ Requirement 4.4, 4.6; `design.md` `model/moe.py` component;
 directly extends entry 016 (loss-free bias balancing) and entry 007 (the
 batch-wide auxiliary loss)
 
+> **Full by-hand derivation:** [`docs/math/026-per-sequence-balance-loss.md`](../docs/math/026-per-sequence-balance-loss.md)
+> carries a 2-sequence, 3-token, 2-expert, top-1 example — every sequence
+> internally 100% collapsed, yet the batch itself perfectly balanced —
+> through every line of `LossFreeBalancer.sequence_balance_loss` and
+> `MoELayer._add_seq_balance_loss`: the reshape's row-major invariant,
+> `f_i`/`P_i` each derived from their exact sum constraints, an exact
+> covariance identity for `Σf_i·P_i` (plus a real counterexample showing
+> the popular "always ≥ 1" claim isn't a theorem), a real side-by-side
+> against the batch-wide Switch loss on identical routing, and the
+> gradient chased in closed form into the router weight — all checked
+> against the real module by
+> [`docs/math/verify_026_per_sequence_balance_loss.py`](../docs/math/verify_026_per_sequence_balance_loss.py).
+
 ## What was implemented
 
 - **`LossFreeBalancer.sequence_balance_loss(routing_probs, topk_indices,

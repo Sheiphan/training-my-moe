@@ -4,6 +4,20 @@
 Requirement 9.1-9.5; `design.md` `model/transformer.py` component;
 directly follows up entry 010's "embedding init blew up the logits" bug
 
+> **Full by-hand derivation:** [`docs/math/023-principled-initialization.md`](../docs/math/023-principled-initialization.md)
+> walks `QwenMoEModel.__init__`'s two init passes on a 2-layer,
+> `d_model=4` model with both routed and shared experts — the post-order
+> `self.apply` visitation, the 34-tensor init ledger, and the
+> `name.endswith(("w_o.weight","w_down.weight","w_2.weight"))` match —
+> derives `nn.init.trunc_normal_`'s exact realized-std factor `0.879626`
+> from the truncated-normal variance integral (confirmed to <0.1% at
+> width 256), then derives the `1/sqrt(2·n_layers)` rule itself from two
+> textbook facts (`Var(ΣXᵢ) = ΣVar(Xᵢ)` for uncorrelated terms; a linear
+> layer's output variance `= fan_in·Var(W)·Var(x)`) and reproduces this
+> entry's `2.4×` vs `9.1×` BASELINE table (`2.38×`/`9.999×` measured,
+> residual-weight-variance ratio `12.08 ≈ 2n` exact) against the real
+> module.
+
 ## What was implemented
 - **`QwenMoEModel.__init__`** now runs a real init scheme instead of
   leaving every `nn.Linear` on PyTorch's default Kaiming-uniform:

@@ -3,6 +3,16 @@
 **Type:** task · **Date:** 2026-08-31 · **Related:** Requirements 4.1, 4.4,
 11.5, 12.6; design.md `data/` component
 
+> **Full by-hand derivation:** [`docs/math/008-data-pipeline.md`](../docs/math/008-data-pipeline.md)
+> carries one concrete 24-token, four-document stream through *every* line
+> of `qwenmoe/data/dataset.py` — `train_val_split` (contiguous `tail`
+> flooring and whole-document `documents` mode), `_document_ids` as a
+> prefix sum, `_split_into_documents`, `TokenDataset`'s `N − seq_len`
+> window count and shift-by-one `(x, y)`, and `make_fixed_slice`'s
+> chunk-size formula, seeded Fisher–Yates `randperm`, and concat/truncate
+> — solved digit by digit to the first `(2, 4)` batch and checked against
+> the real module by [`docs/math/verify_008_data_pipeline.py`](../docs/math/verify_008_data_pipeline.py).
+
 ## What was implemented
 - `qwenmoe/data/download.py::download_corpus(name, cache_dir) -> Path` —
   the project's only network-touching function. `"tiny_shakespeare"` fetches

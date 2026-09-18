@@ -3,6 +3,19 @@
 **Type:** task · **Date:** 2026-09-02 · **Related:** `moe-modernization`
 Requirement 3.1-3.4; `design.md` `train/trainer.py` component
 
+> **Full by-hand derivation:** [`docs/math/024-mixed-precision-and-z-loss.md`](../docs/math/024-mixed-precision-and-z-loss.md)
+> reuses the 006/010 model, weights and window unchanged and derives IEEE
+> 754 from the bits up (a real tensor entry converted fp32→bf16 by hand,
+> matching `Tensor.to(torch.bfloat16)` exactly), then **measures** (rather
+> than assumes) `torch.autocast`'s real op policy via forward hooks on
+> every submodule — including the finding that plain `F.softmax` /
+> `torch.logsumexp` are *not* auto-promoted to fp32 on this project's
+> PyTorch build, only `F.cross_entropy` is — proves cross-entropy's
+> shift-invariance in general and on the model's own real logits, and
+> traces the MoE dtype-safety fix digit by digit, reproducing the real
+> `RuntimeError` it prevents; every number checked against the real
+> module by [`docs/math/verify_024_mixed_precision_and_z_loss.py`](../docs/math/verify_024_mixed_precision_and_z_loss.py).
+
 ## What was implemented
 
 - **`_forward_backward_step` (in `qwenmoe/train/trainer.py`)** grew three

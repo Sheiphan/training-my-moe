@@ -4,6 +4,21 @@
 Requirement 1.1-1.3; `design.md` `train/optim.py` component; builds on
 entry 010's AdamW/cosine-schedule introduction
 
+> **Full by-hand derivation:** [`docs/math/018-optimizer-hardening.md`](../docs/math/018-optimizer-hardening.md)
+> walks `split_param_groups` over `model.modules()` parameter by parameter
+> (the `recurse=False` fetch, the `id()` dedup, the "no_decay if
+> `RMSNorm`/`nn.Embedding` module **or** `ndim < 2`, else decay" rule),
+> gives the 22 / 256 vs 6 / 44 counts and the tied-vs-untied `lm_head`
+> cases, then the global gradient 2-norm as the quadrature sum
+> `√(Σ‖g_p‖²) = √10.383615 = 3.222362` (the six zero-token expert matrices
+> contributing 0), the exact clipping algebra, the decoupled `θ(1−γλ)`
+> term, and — from first principles — `β₂`'s effective averaging window
+> (`(1−β₂)β₂ᵏ` weights → mean lag `β₂/(1−β₂)` = 19 vs 999, `1/e` length
+> `−1/ln β₂` and its Taylor `1/(1−β₂)` = 20 vs 1000, a regime-change
+> experiment) and `weight_decay`'s compounding pull `(1−γλ)^S` (26% vs 3%
+> over 10k steps) — every number checked against the real code by
+> [`docs/math/verify_018_optimizer_hardening.py`](../docs/math/verify_018_optimizer_hardening.py).
+
 ## What was implemented
 - **`qwenmoe/train/optim.py`** (new): `split_param_groups(model) ->
   (decay, no_decay)` and `build_optimizer(model, config) -> Optimizer`.

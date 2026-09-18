@@ -13,6 +13,14 @@ follow-up measurement.
 
 The reproducible driver is
 [`notebooks/07_modernized_presets.ipynb`](../notebooks/07_modernized_presets.ipynb);
+
+> **Math companion:** [`docs/math/035-modernized-presets-training-run.md`](../docs/math/035-modernized-presets-training-run.md)
+> derives expert load, coefficient of variation, and normalized routing
+> entropy from scratch — the exact `mean(load) = 1/n_experts` identity,
+> population-vs-sample variance, and a full proof of entropy's `[0,1]`
+> bound — traced through the real `Router` → top-*k* → `bincount` code
+> path and `balance_stats`, solved by hand on a tiny 2-layer example.
+
 its figures are in `journey_of_a_model/figures/035/` and the raw numbers in
 `figures/035/results.json` (and `runs/modernized_presets/results.json`).
 

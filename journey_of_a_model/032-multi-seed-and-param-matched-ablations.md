@@ -5,6 +5,14 @@ Requirement 12.1, 12.2, 12.4; `design.md` `train/compare.py` component;
 follows up entry 008 (`make_fixed_slice` / compute-matched comparison) and
 the `extra-manim-preview-task15` preview of `run_comparison`
 
+> **Full derivation, solved by hand:** [`docs/math/032-multi-seed-and-param-matched-ablations.md`](../docs/math/032-multi-seed-and-param-matched-ablations.md)
+> — the sample mean/Bessel-corrected std and the `hypot` noise band derived
+> from scratch (and shown to be `√n` looser than a textbook standard-error
+> test), `match_d_ff_to_param_budget`'s doubling-then-bisection search
+> proven correct and traced exactly to `d_ff=6`, and a real tiny
+> `run_comparison` call showing a compute-matched "differs" verdict become
+> "within noise" once parameter-matched.
+
 ## What was implemented
 
 - **`run_comparison(..., *, seeds=None, param_matched=False,

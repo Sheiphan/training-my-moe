@@ -3,6 +3,17 @@
 **Type:** task · **Date:** 2026-08-31 · **Related:** Requirements 3.2,
 5.1-5.5, 8.1, 8.2, 10.1; design.md `train/trainer.py` component
 
+> **Full by-hand derivation:** [`docs/math/010-training-loop.md`](../docs/math/010-training-loop.md)
+> carries one optimizer step (then four more) of `Trainer.fit` on the 006
+> model and a single `[4,1,4] → [1,4,1]` window through *every* line of
+> `_run_step` — the warmup+cosine LR schedule, `F.cross_entropy` from
+> softmax, the `softmax − onehot` logit gradient and a full by-hand
+> `∂L/∂ final_norm.weight`, global-norm gradient clipping, and **AdamW
+> derived from zero** (two moments, bias correction, decoupled weight
+> decay) computed digit by digit — plus gradient accumulation, the z-loss,
+> perplexity, and checkpoint/resume bit-identity, all checked against the
+> real module by [`docs/math/verify_010_training_loop.py`](../docs/math/verify_010_training_loop.py).
+
 ## What was implemented
 - `qwenmoe/train/trainer.py` (new): `Trainer.fit(model, train_dataset,
   val_dataset, config, resume_from=None) -> TrainResult` — AdamW, a

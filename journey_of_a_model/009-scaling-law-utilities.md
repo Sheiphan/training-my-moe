@@ -3,6 +3,17 @@
 **Type:** task · **Date:** 2026-08-31 · **Related:** Requirements 11.1-11.4;
 design.md `train/scaling.py` component
 
+> **Full by-hand derivation:** [`docs/math/009-scaling-law-utilities.md`](../docs/math/009-scaling-law-utilities.md)
+> carries one 46-tensor toy MoE model through every line of
+> `qwenmoe/train/scaling.py` — `count_params`' per-bucket walk (with the
+> `total − active = L(E−k)·P_expert` identity and an independent
+> raw-dedup'd cross-check), `chinchilla_budget`'s constant-ratio algebra
+> vs. the empirical 20, `moe_budget_note`, `epochs_for_budget`'s strict
+> `> 4` warning, and `calibrate_throughput`'s `batch·seq·n_steps / elapsed`
+> (verified exactly with a monkeypatched clock) — to an end-to-end
+> `active → D_ref → epochs` and wall-clock estimate, every number checked
+> against the real module by [`docs/math/verify_009_scaling_law_utilities.py`](../docs/math/verify_009_scaling_law_utilities.py).
+
 ## What was implemented
 - `qwenmoe/train/scaling.py::ParamBreakdown` — a dataclass with
   `embedding`, `attention_total`, `moe_total`, `moe_active`, `total`,

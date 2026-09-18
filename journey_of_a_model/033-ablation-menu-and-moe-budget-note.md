@@ -6,6 +6,21 @@ Requirement 12.3, 12.5, 12.6; `design.md` `train/compare.py` +
 entries 008/015 (the original menu), 024–030 (each new axis), and 032
 (multi-seed / param-matched)
 
+> **Full by-hand derivation (of `moe_budget_note`):**
+> [`docs/math/033-ablation-menu-and-moe-budget-note.md`](../docs/math/033-ablation-menu-and-moe-budget-note.md)
+> derives the sparsity-bracket argument this entry's caveat only states —
+> why a dense model's parameter count plays a compute role and a capacity
+> role at once, why a routed MoE splits those roles apart (compute →
+> active, capacity → total and beyond, per Clark et al. 2022), and why
+> neither `20×active` nor `20×total` alone is correct — on a
+> `total=1,000,000`/`active=250,000` (4.0×) example plus a from-scratch
+> proof that `total ≥ active` always, every number checked against the
+> real module by
+> [`docs/math/verify_033_ablation_menu_and_moe_budget_note.py`](../docs/math/verify_033_ablation_menu_and_moe_budget_note.py),
+> including a byte-for-byte reproduction of this entry's own quoted
+> paragraph below. (The ablation menu and `train_overrides` are software
+> plumbing with no arithmetic to derive, so that doc doesn't cover them.)
+
 ## What was implemented
 
 - **`scripts/run_ablation_study.py::VARIANTS`** — extended from 8 entries

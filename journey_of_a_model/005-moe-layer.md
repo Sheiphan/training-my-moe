@@ -3,6 +3,14 @@
 **Type:** task · **Date:** 2026-08-31 · **Related:** Requirements 2.1-2.5,
 9.4, 12.2, 12.3; design.md `model/moe.py` component
 
+> **Full by-hand derivation:** [`docs/math/005-moe-layer.md`](../docs/math/005-moe-layer.md)
+> carries one concrete 3-token, 4-expert (top-2), 1-shared-expert example
+> through *every* line of `MoELayer.forward_with_trace` — the router
+> logits, softmax, top-k selection, weight renormalisation, each SwiGLU
+> expert, the zero-token expert skip, the scatter-add, the shared expert,
+> and the load-balancing auxiliary loss — solved digit by digit and checked
+> against the real module by [`docs/math/verify_005_moe_layer.py`](../docs/math/verify_005_moe_layer.py).
+
 ## What was implemented
 - `qwenmoe/model/moe.py::SwiGLUExpert` / `GEGLUExpert` / `GELUExpert` — the
   three expert activation variants, plus `build_expert(config)` selecting

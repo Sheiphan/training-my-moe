@@ -4,6 +4,19 @@
 Requirement 8.1-8.4; `design.md` `model/kv_cache.py` + `model/attention.py`
 components; follows up entries 004 (GQA) and 012 (MLA)
 
+> **Full by-hand derivation:** [`docs/math/029-kv-cache.md`](../docs/math/029-kv-cache.md)
+> extends doc 004's GQA example and doc 016's MLA example by one
+> incremental "token 3" each: the $O(n)$-vs-$O(n^2)$/$O(n^3)$ counting
+> argument derived from exact sum formulas, `LayerKVCache`/`LatentKVCache`'s
+> `append` mechanics, a prefill proven bit-identical to no cache at all,
+> the incremental step's RoPE rotation at the *true* `position_offset`,
+> `_causal_position_mask` derived for the non-square 1-query/N-key case,
+> the full scores→softmax→weighted-sum digit-by-digit (checked against a
+> full recompute), the cache-byte ledger re-deriving the journal's own
+> `0.156` ratio independently, and `generate()`'s branch selection verified
+> end-to-end on a real model — every number reproduced by
+> [`docs/math/verify_029_kv_cache.py`](../docs/math/verify_029_kv_cache.py).
+
 ## What was implemented
 
 - **`qwenmoe/model/kv_cache.py`** (new):

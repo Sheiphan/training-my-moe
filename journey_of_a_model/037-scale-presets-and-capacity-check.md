@@ -2,6 +2,8 @@
 
 **Type:** experiment + tooling (follow-up to 034/035/036, not a spec task) · **Date:** 2026-09-05
 
+> **Solved-by-hand companion:** [`docs/math/037-scale-presets-and-capacity-check.md`](../docs/math/037-scale-presets-and-capacity-check.md) derives `scripts/check_capacity.py`'s parameter-count, memory-budget, and KV-cache-size arithmetic from first principles on a tiny worked example, then verifies every number against the real module.
+
 ## TL;DR
 
 - **Bigger dataset:** switched from `tiny_shakespeare` (~1M characters) to

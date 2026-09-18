@@ -3,6 +3,18 @@
 **Type:** task · **Date:** 2026-08-31 · **Related:** Requirements 6.1-6.4;
 design.md `generate.py`/`scripts/generate.py` components (tasks 11.1, 11.2)
 
+> **Full by-hand derivation:** [`docs/math/011-inference-generation.md`](../docs/math/011-inference-generation.md)
+> walks every line of `generate()` on the 006 model, a `CharTokenizer`, and
+> the prompt `"DAD"` (ids `[4,1,4]`, so decode step 1's logits *are* 006's
+> hand-derived last row): the loop and both stop conditions, `logits[:, -1, :]`,
+> then `_sample_next` in full — the sign-aware repetition penalty, the
+> temperature `T→0` / `T→∞` limits, `filter_top_k` / `filter_top_p` /
+> `filter_min_p` derived and computed digit by digit, softmax, and
+> `torch.multinomial` (with a 100k-draw frequency check). It also runs the
+> greedy "DADDDD" degeneration and shows the KV-cache path emits a
+> byte-identical greedy sequence — all checked against the real module by
+> [`docs/math/verify_011_inference_generation.py`](../docs/math/verify_011_inference_generation.py).
+
 ## What was implemented
 - `qwenmoe/model/generate.py::generate(model, tokenizer, prompt,
   max_new_tokens, temperature, top_k, top_p, device) -> str` —

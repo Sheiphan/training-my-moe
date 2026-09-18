@@ -5,6 +5,14 @@ Requirement 10.1-10.4; `design.md` `data/dataset.py` + `scripts/prepare_data.py`
 + `model/attention.py` components; follows up entry 008 (`TokenDataset` /
 `train_val_split`) and entry 013 (fused SDPA + additive masks)
 
+> **Full derivation, solved by hand:** [`docs/math/031-document-boundaries.md`](../docs/math/031-document-boundaries.md)
+> — `build_document_mask` derived from broadcasting first principles and
+> traced digit by digit through `Attention.forward`'s causal-plus-document
+> mask fold-in, on doc 004/021's exact GQA example plus one real
+> `TokenDataset`-derived `segment_ids`; proves (not just measures) that
+> document isolation is bit-for-bit exact, and follows it through
+> `MLAAttention` and a full 2-layer `QwenMoEModel`.
+
 ## What was implemented
 
 - **`ByteBPETokenizer(..., eos_token=False)`** (`qwenmoe/tokenizer/bpe.py`) —

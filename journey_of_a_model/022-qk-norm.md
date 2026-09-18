@@ -4,6 +4,18 @@
 Requirement 7.3, 7.5; `design.md` `model/attention.py` component; builds
 on entry 021's fused-SDPA work
 
+> **Full by-hand derivation:** [`docs/math/022-qk-norm.md`](../docs/math/022-qk-norm.md)
+> carries one concrete 3-token, 2-head, 1-KV-head, `head_dim=4` example
+> (including this entry's own $[3,0,4,0]\to[1.2,0,1.6,0]$) through *every*
+> line of `Attention.forward_with_trace` with `qk_norm=True` — RMSNorm
+> derived from scratch (exact scale-invariance, the $\lVert q'\rVert=\sqrt{d_k}$
+> proof), the Cauchy–Schwarz ceiling measured digit-by-digit on nine real
+> logit pairs, a quadratic-vs-flat scale sweep, softmax-entropy collapse
+> quantified on real numbers, and why the norm sits before the positional
+> transform (rotation preserves norm; the two orders provably commute at
+> init) — every number checked against the real module by
+> [`docs/math/verify_022_qk_norm.py`](../docs/math/verify_022_qk_norm.py).
+
 ## What was implemented
 - **`qwenmoe/model/attention.py::Attention`** gains `self.qk_norm`
   (`ModelConfig.qk_norm`, default `False`) and, only when it's `True`,

@@ -3,6 +3,15 @@
 **Type:** task · **Date:** 2026-08-31 · **Related:** Requirements 1.1, 1.2,
 1.7, 9.5; design.md `model/block.py` / `model/transformer.py` components
 
+> **Full by-hand derivation:** [`docs/math/006-full-model-assembly.md`](../docs/math/006-full-model-assembly.md)
+> carries one concrete 3-token (`[4, 1, 4]`), 2-layer example through
+> *every* line of `QwenMoEModel.forward` / `TransformerBlock.forward` — the
+> embedding lookup, RMSNorm derived from scratch, the pre-norm residual
+> adds, the block stack, the final norm, the weight-tied LM head, and the
+> mean-not-sum combination of per-block aux losses — solved digit by digit
+> and checked against the real module by
+> [`docs/math/verify_006_full_model_assembly.py`](../docs/math/verify_006_full_model_assembly.py).
+
 ## What was implemented
 - `qwenmoe/model/attention.py::build_attention(config)` — a factory
   selecting the attention variant named by `config.attention_variant`,

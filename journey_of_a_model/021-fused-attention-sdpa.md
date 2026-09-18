@@ -4,6 +4,17 @@
 Requirement 7.1-7.2, 7.4-7.5; `design.md` `model/attention.py` component;
 builds on entry 004's original GQA implementation
 
+> **Full by-hand derivation:** [`docs/math/021-fused-attention-sdpa.md`](../docs/math/021-fused-attention-sdpa.md)
+> reuses doc 004's exact 3-token, 2-head, 1-KV-head example and picks up
+> where `forward` (fused) diverges from `forward_with_trace` (explicit):
+> the `⌊h/n_rep⌋` broadcast behind `enable_gqa=True`, the `triu(-inf)` mask
+> `is_causal=True` rebuilds from a flag, the **online/streaming softmax**
+> inside the kernel derived from scratch (the `α = e^(m_old−m_new)` rescale,
+> an induction proof it equals one-shot softmax exactly), the ALiBi
+> `attn_mask = causal + bias` fold-in, and the float32-non-associativity
+> reason the two paths agree only to ~2e-7 — every number checked against
+> the real module by [`docs/math/verify_021_fused_attention_sdpa.py`](../docs/math/verify_021_fused_attention_sdpa.py).
+
 ## What was implemented
 - **`qwenmoe/model/attention.py::Attention.forward`** now calls
   `F.scaled_dot_product_attention` instead of building an explicit

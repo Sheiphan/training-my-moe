@@ -3,6 +3,16 @@
 **Type:** task · **Date:** 2026-08-31 · **Related:** Requirement 12.4;
 design.md `model/attention.py` component (`MLAAttention`)
 
+> **Full by-hand derivation:** [`docs/math/016-mla-attention.md`](../docs/math/016-mla-attention.md)
+> carries one concrete 3-token, 2-head, `head_dim=4`, `latent_dim=2`
+> example through *every* line of `MLAAttention.forward_with_trace` — the
+> `x → c_kv` compression, the per-head up-projection of K/V from that one
+> shared latent, the full derivation of *why* the decoupled-RoPE split is
+> forced (rotating the reconstructed key would entangle the position with
+> the up-projection matrix), the `[content ; rope]` concat, and the
+> mask/softmax/weighted-sum solved digit by digit — all checked against
+> the real module by [`docs/math/verify_016_mla_attention.py`](../docs/math/verify_016_mla_attention.py).
+
 ## What was implemented
 - **`qwenmoe/model/attention.py::MLAAttention`** — a simplified
   Multi-Head Latent Attention module (DeepSeek-V2/V3), selected via

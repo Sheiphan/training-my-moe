@@ -4,6 +4,14 @@
 Requirement 1.4-1.6; `design.md` `train/optim.py` component; builds on
 entry 018's AdamW/param-group work
 
+> **Full by-hand derivation:** [`docs/math/020-muon-optimizer.md`](../docs/math/020-muon-optimizer.md)
+> carries one `3×2` gradient and weight through *every* line of the
+> `optimizer="muon"` path — the `f(X) → U·p(Σ)·Vᵀ` reduction, the scalar
+> quintic composed five times by hand, `p`'s fixed points vs. its actual
+> 2-cycle, the `√max(1, rows/cols)` factor, `CombinedOptimizer`, and the
+> two-peak `_set_lr` schedule — each step checked against the real module
+> by [`docs/math/verify_020_muon_optimizer.py`](../docs/math/verify_020_muon_optimizer.py).
+
 ## What was implemented
 - **`qwenmoe/train/optim.py`** gained four new pieces:
   - `zeropower_via_newtonschulz5(G, steps=5)` — the from-scratch

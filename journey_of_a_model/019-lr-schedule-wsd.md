@@ -4,6 +4,18 @@
 Requirement 2.1-2.4; `design.md` `train/trainer.py` component; builds on
 entry 010's warmup+cosine introduction
 
+> **Full by-hand derivation:** [`docs/math/019-lr-schedule-wsd.md`](../docs/math/019-lr-schedule-wsd.md)
+> sweeps one parameter set (`warmup_steps=4`, `total_steps=20`,
+> `min_lr_ratio=0.25`, `decay_fraction=0.28`, peak `lr=0.01`) through
+> *every* branch of `lr_multiplier` and `_set_lr` — the `(step+1)/W`
+> warmup ramp, the cosine curve `½(1+cos(π·progress))` derived from the
+> unit circle, the `min_lr_ratio` interpolation blend, WSD's
+> `decay_steps = max(1, round(f·T))` / `decay_start = max(W, T−decay_steps)`
+> / flat plateau / linear decay to the floor, the unknown-schedule error,
+> and `_set_lr` scaling one shape onto AdamW and Muon param groups at two
+> peak magnitudes — all checked against the real module (and a real
+> `Trainer.fit` log) by [`docs/math/verify_019_lr_schedule_wsd.py`](../docs/math/verify_019_lr_schedule_wsd.py).
+
 ## What was implemented
 - **`qwenmoe/train/trainer.py::lr_multiplier`** gained three new parameters
   — `schedule` (`"cosine"` default, or `"wsd"`), `min_lr_ratio` (default

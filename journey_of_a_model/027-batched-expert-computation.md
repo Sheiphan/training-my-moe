@@ -4,6 +4,8 @@
 Requirement 5.1-5.5; `design.md` `model/moe.py` component;
 follows up entry 006 (the MoE layer) and entry 009 (the expert dispatch loop)
 
+> **Full derivation:** [`docs/math/027-batched-expert-computation.md`](../docs/math/027-batched-expert-computation.md) works `dispatch_batched` line by line, by hand, on a fully-worked tiny example (with an idle expert and unequal padding), verified against the real module.
+
 ## What was implemented
 
 - **`dispatch_batched(x_flat, topk_indices, topk_weights, routed_experts,

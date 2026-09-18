@@ -4,6 +4,22 @@
 Requirement 12.5, 13.4; `design.md` `configs/presets.py` component; the
 capstone entry — pulls together the evidence from entries 018–033
 
+> **Full by-hand derivation (of the parameter-budget algebra behind
+> `FINEGRAINED`, plus where `sqrt(2/(5·d_model))` actually comes from):**
+> [`docs/math/034-modernized-presets.md`](../docs/math/034-modernized-presets.md)
+> derives DeepSeekMoE's fine-grained-segmentation algebra once —
+> `routed_total`/`routed_active` exactly invariant under
+> $(E,d_\text{ff},k)\to(Es,d_\text{ff}/s,ks)$, while `shared` shrinks and
+> `router` grows — on a real `MoELayer` at two granularities, then traces
+> `_V2_INIT_STD` to Glorot & Bengio's harmonic-mean compromise plugged
+> into the original Transformer's `4×` FFN convention (Nguyen & Salazar's
+> "SmallInit"), and predicts (not just quotes) the untrained-logit-std
+> ratio between all three presets from the `init_std` change alone,
+> confirmed to <0.5% over 12 real seeds by
+> [`docs/math/verify_034_modernized_presets.py`](../docs/math/verify_034_modernized_presets.py).
+> The `qk_norm`/sigmoid-routing recaps it also uses point to docs
+> 022/025.
+
 ## What was implemented
 
 - **`configs/presets.py::BASELINE_V2`** — `dataclasses.replace(BASELINE,
