@@ -84,6 +84,13 @@ def main() -> None:
     parser.add_argument("--tokenizer-type", choices=["char", "bpe"], default="char")
     parser.add_argument("--bpe-vocab-size", type=int, default=4096)
     parser.add_argument("--cache-dir", type=Path, default=Path(".cache/data"))
+    parser.add_argument(
+        "--corpus-chars",
+        type=int,
+        default=None,
+        help="must match the --corpus-chars prepare_data.py was run with, since "
+        "it selects which prepared-data directory to load",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--total-tokens", type=int, required=True, help="training token budget")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -126,6 +133,7 @@ def main() -> None:
         tokenizer_type=args.tokenizer_type,
         bpe_vocab_size=args.bpe_vocab_size,
         cache_dir=args.cache_dir,
+        corpus_chars=args.corpus_chars,
         val_split_mode=args.val_split_mode,
     )
     tokens, tokenizer_meta = _load_prepared_data(data_config)

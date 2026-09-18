@@ -6,6 +6,7 @@ size here is emergent from the corpus, not a configured target.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 
 
@@ -18,8 +19,14 @@ class CharTokenizer:
     def vocab_size(self) -> int:
         return len(self._stoi)
 
-    def train(self, text: str) -> None:
-        chars = sorted(set(text))
+    def train(self, text: str | Iterable[str]) -> None:
+        """`text` may be one string, or an iterable of blocks — a corpus too
+        large to hold in memory is streamed past in pieces (journal 040) and
+        only the character set is retained."""
+        seen: set[str] = set()
+        for block in (text,) if isinstance(text, str) else text:
+            seen.update(block)
+        chars = sorted(seen)
         self._stoi = {ch: i for i, ch in enumerate(chars)}
         self._itos = dict(enumerate(chars))
 

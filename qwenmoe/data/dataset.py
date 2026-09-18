@@ -16,9 +16,14 @@ from torch.utils.data import Dataset
 _DEFAULT_CHUNK_SIZE = 1024
 
 
-def _as_long_tensor(tokens: list[int] | Tensor) -> Tensor:
+def _as_token_tensor(tokens: list[int] | Tensor) -> Tensor:
+    """A tensor is kept in the dtype it arrives in (journal 040):
+    `scripts/prepare_data.py` writes `int32`, and upcasting a ~1B-token
+    stream to `int64` here would double it to ~8GB for no benefit --
+    `__getitem__` casts each `seq_len` window instead, which is what the
+    embedding lookup actually needs. A plain list still becomes `int64`."""
     if isinstance(tokens, Tensor):
-        return tokens.to(dtype=torch.long)
+        return tokens
     return torch.tensor(tokens, dtype=torch.long)
 
 
@@ -63,7 +68,7 @@ class TokenDataset(Dataset):
                 "separator id recorded in tokenizer.json by scripts/prepare_data.py "
                 "(run it with --split-documents)"
             )
-        tokens = _as_long_tensor(tokens)
+        tokens = _as_token_tensor(tokens)
         if tokens.numel() < seq_len + 1:
             raise ValueError(
                 f"need at least seq_len + 1 = {seq_len + 1} tokens, got {tokens.numel()}"
@@ -78,8 +83,11 @@ class TokenDataset(Dataset):
         return self._tokens.numel() - self._seq_len
 
     def __getitem__(self, idx: int):
-        x = self._tokens[idx : idx + self._seq_len]
-        y = self._tokens[idx + 1 : idx + self._seq_len + 1]
+        # Cast per window, not per corpus: nn.Embedding needs int64 indices,
+        # but only these `seq_len` positions have to be in that dtype
+        # (journal 040).
+        x = self._tokens[idx : idx + self._seq_len].to(torch.long)
+        y = self._tokens[idx + 1 : idx + self._seq_len + 1].to(torch.long)
         if not self._return_segments:
             return x, y
         window = self._doc_ids[idx : idx + self._seq_len]
@@ -123,7 +131,7 @@ def train_val_split(
     """
     if not 0.0 < val_fraction < 1.0:
         raise ValueError(f"val_fraction must be in (0, 1), got {val_fraction}")
-    tokens = _as_long_tensor(tokens)
+    tokens = _as_token_tensor(tokens)
 
     if mode == "tail":
         n_val = int(tokens.numel() * val_fraction)
@@ -171,7 +179,7 @@ def make_fixed_slice(all_tokens: list[int] | Tensor, n_tokens: int, seed: int) -
     """
     if n_tokens < 1:
         raise ValueError(f"n_tokens must be >= 1, got {n_tokens}")
-    all_tokens = _as_long_tensor(all_tokens)
+    all_tokens = _as_token_tensor(all_tokens)
     if n_tokens > all_tokens.numel():
         raise ValueError(
             f"n_tokens ({n_tokens}) exceeds available tokens ({all_tokens.numel()})"

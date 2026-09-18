@@ -97,25 +97,34 @@ def _to_ascii(text: str) -> str:
     return text.encode("ascii", "ignore").decode("ascii")
 
 
-def _extract_fineweb_edu_text(shard_path: Path, target_chars: int) -> str:
+def _write_fineweb_edu_text(shard_path: Path, dest: Path, target_chars: int) -> int:
     """Reads `shard_path`'s `text` column row-group by row-group,
     ASCII-folding each document (`_to_ascii`) and keeping it only if that
-    didn't hollow it out, stopping as soon as `target_chars` characters
-    have been accumulated -- so a ~2.15GB shard is never fully
-    materialized in memory just to keep a filtered fraction of it."""
+    didn't hollow it out, writing straight out to `dest` and stopping as
+    soon as `target_chars` characters have been written. Returns the
+    character count.
+
+    Streamed rather than accumulated (journal 040): at this module's
+    original 400M-character cap a list-of-documents plus its `join` was
+    affordable, but a whole ~3.5B-character shard would need several times
+    24GB to hold the same way. Nothing larger than one row group is ever
+    resident.
+    """
     parquet_file = pq.ParquetFile(shard_path)
-    documents: list[str] = []
     total_chars = 0
-    for batch in parquet_file.iter_batches(columns=["text"]):
-        for text in batch.column("text").to_pylist():
-            ascii_text = _to_ascii(text)
-            if len(ascii_text) < _FINEWEB_EDU_MIN_RETAINED_FRACTION * len(text):
-                continue
-            documents.append(ascii_text)
-            total_chars += len(ascii_text)
-            if total_chars >= target_chars:
-                return _DOCUMENT_SEPARATOR.join(documents)
-    return _DOCUMENT_SEPARATOR.join(documents)
+    with dest.open("w", encoding="utf-8") as out:
+        for batch in parquet_file.iter_batches(columns=["text"]):
+            for text in batch.column("text").to_pylist():
+                ascii_text = _to_ascii(text)
+                if len(ascii_text) < _FINEWEB_EDU_MIN_RETAINED_FRACTION * len(text):
+                    continue
+                if total_chars:
+                    out.write(_DOCUMENT_SEPARATOR)
+                out.write(ascii_text)
+                total_chars += len(ascii_text)
+                if total_chars >= target_chars:
+                    return total_chars
+    return total_chars
 
 
 # Matches scripts/prepare_data.py's own document separator so
@@ -124,10 +133,18 @@ _DOCUMENT_SEPARATOR = "<|endoftext|>"
 
 
 def download_corpus(
-    name: Literal["tiny_shakespeare", "tiny_stories", "fineweb_edu"], cache_dir: str | Path
+    name: Literal["tiny_shakespeare", "tiny_stories", "fineweb_edu"],
+    cache_dir: str | Path,
+    target_chars: int | None = None,
 ) -> Path:
     """Downloads (if not already cached) `name`'s raw text corpus under
-    `cache_dir`, and returns the local path to the cached text file."""
+    `cache_dir`, and returns the local path to the cached text file.
+
+    `target_chars` caps how much of a size-parameterized corpus
+    (`fineweb_edu`) is kept, defaulting to `_FINEWEB_EDU_TARGET_CHARS`. It
+    is part of the cache filename, so asking for a different size prepares
+    a different file instead of silently reusing the previous one.
+    """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -150,7 +167,8 @@ def download_corpus(
         return Path(path)
 
     if name == "fineweb_edu":
-        dest = cache_dir / "fineweb_edu_sample.txt"
+        chars = target_chars if target_chars is not None else _FINEWEB_EDU_TARGET_CHARS
+        dest = cache_dir / f"fineweb_edu_{chars // 1_000_000}Mchars.txt"
         if not dest.exists():
             shard_path = hf_hub_download(
                 repo_id=_FINEWEB_EDU_REPO_ID,
@@ -158,8 +176,11 @@ def download_corpus(
                 repo_type="dataset",
                 cache_dir=cache_dir,
             )
-            text = _extract_fineweb_edu_text(Path(shard_path), _FINEWEB_EDU_TARGET_CHARS)
-            dest.write_text(text, encoding="utf-8")
+            # Written to a temporary name first so an interrupted run can't
+            # leave a short file behind that later looks like a valid cache.
+            partial = dest.with_suffix(".partial")
+            _write_fineweb_edu_text(Path(shard_path), partial, chars)
+            partial.replace(dest)
         return dest
 
     raise ValueError(f"Unknown corpus: {name!r}")
@@ -168,7 +189,9 @@ def download_corpus(
 def prepared_data_dir(config: DataConfig) -> Path:
     """Where `scripts/prepare_data.py` writes (and `scripts/train.py` later
     reads) a corpus's trained tokenizer + encoded tokens -- named so that
-    different `bpe_vocab_size` targets for the same corpus don't collide.
+    different `bpe_vocab_size` targets, or different `corpus_chars` sizes
+    of the same corpus, don't collide.
     """
     suffix = f"bpe{config.bpe_vocab_size}" if config.tokenizer_type == "bpe" else "char"
-    return Path(config.cache_dir) / f"{config.corpus}_{suffix}"
+    size = f"_{config.corpus_chars // 1_000_000}Mchars" if config.corpus_chars else ""
+    return Path(config.cache_dir) / f"{config.corpus}{size}_{suffix}"

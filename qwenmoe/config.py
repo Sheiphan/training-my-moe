@@ -195,6 +195,10 @@ class DataConfig:
     tokenizer_type: Literal["char", "bpe"]
     bpe_vocab_size: int = 4096
     cache_dir: Path = Path(".cache/data")
+    # Raw-character cap for size-parameterized corpora (`fineweb_edu`);
+    # None keeps that corpus's own default. Part of the prepared-data
+    # directory name, so two sizes never overwrite each other.
+    corpus_chars: int | None = None
     fixed_slice_tokens: int | None = None   # ablation mode: same slice for every variant
     fixed_slice_seed: int = 0
     # moe-modernization spec (Requirement 10.4): "tail" == last val_fraction of
@@ -208,5 +212,7 @@ class DataConfig:
             raise ValueError(
                 f"fixed_slice_tokens must be >= 1 if set, got {self.fixed_slice_tokens}"
             )
+        if self.corpus_chars is not None and self.corpus_chars < 1:
+            raise ValueError(f"corpus_chars must be >= 1 if set, got {self.corpus_chars}")
         if isinstance(self.cache_dir, str):
             self.cache_dir = Path(self.cache_dir)

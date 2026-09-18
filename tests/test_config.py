@@ -1,6 +1,7 @@
 import pytest
 
 from qwenmoe.config import DataConfig, ModelConfig, TrainConfig
+from qwenmoe.data.download import prepared_data_dir
 
 
 def test_model_config_valid_defaults():
@@ -91,6 +92,28 @@ def test_train_config_modernization_defaults():
 def test_data_config_val_split_mode_default():
     cfg = DataConfig(corpus="tiny_shakespeare", tokenizer_type="char")
     assert cfg.val_split_mode == "tail"
+
+
+def test_data_config_corpus_chars_defaults_to_none():
+    cfg = DataConfig(corpus="fineweb_edu", tokenizer_type="bpe")
+    assert cfg.corpus_chars is None
+
+
+def test_data_config_rejects_non_positive_corpus_chars():
+    with pytest.raises(ValueError):
+        DataConfig(corpus="fineweb_edu", tokenizer_type="bpe", corpus_chars=0)
+
+
+def test_prepared_data_dir_separates_corpus_sizes():
+    """Two sizes of the same corpus must not share a prepared-data
+    directory, or a bigger run silently trains on the smaller cache."""
+    small = DataConfig(corpus="fineweb_edu", tokenizer_type="bpe", corpus_chars=400_000_000)
+    large = DataConfig(corpus="fineweb_edu", tokenizer_type="bpe", corpus_chars=3_500_000_000)
+    default = DataConfig(corpus="fineweb_edu", tokenizer_type="bpe")
+
+    assert prepared_data_dir(small) != prepared_data_dir(large)
+    assert prepared_data_dir(default) != prepared_data_dir(small)
+    assert prepared_data_dir(small).name == "fineweb_edu_400Mchars_bpe4096"
 
 
 @pytest.mark.parametrize(

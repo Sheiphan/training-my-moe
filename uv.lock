@@ -3072,6 +3072,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "jupyter" },
     { name = "manim" },
+    { name = "numpy" },
     { name = "pyarrow" },
     { name = "torch" },
 ]
@@ -3091,6 +3092,7 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=1.29.0" },
     { name = "jupyter", specifier = ">=1.1.1" },
     { name = "manim", specifier = ">=0.21.0" },
+    { name = "numpy", specifier = ">=2.5.2" },
     { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "torch", specifier = ">=2.13.0" },
 ]

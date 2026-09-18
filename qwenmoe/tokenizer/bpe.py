@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
 
 _BASE_VOCAB_SIZE = 256  # every possible byte value 0-255
@@ -117,14 +118,23 @@ class ByteBPETokenizer:
         with `eos_token=True`): the first id past the byte+merge vocab."""
         return len(self._vocab) if self._eos_token else None
 
-    def train(self, text: str) -> None:
+    def train(self, text: str | Iterable[str]) -> None:
+        """`text` may be one string, or an iterable of blocks — a corpus too
+        large to hold in memory is streamed past in pieces (journal 040).
+        Only the chunk-frequency table is retained, and it is bounded by the
+        number of *distinct* chunks, not by corpus size. Blocks must not
+        split a pre-token across the boundary (cut them at whitespace);
+        `scripts/prepare_data.py` cuts on newlines.
+        """
         self._merges = {}
         self._vocab = {i: bytes([i]) for i in range(_BASE_VOCAB_SIZE)}
         self._encode_cache = {}
 
-        chunk_freqs = Counter(
-            match.group().encode("utf-8") for match in _PRE_TOKEN_PATTERN.finditer(text)
-        )
+        chunk_freqs: Counter[bytes] = Counter()
+        for block in (text,) if isinstance(text, str) else text:
+            chunk_freqs.update(
+                match.group().encode("utf-8") for match in _PRE_TOKEN_PATTERN.finditer(block)
+            )
         chunks = [list(chunk) for chunk in chunk_freqs]
         freqs = list(chunk_freqs.values())
 
