@@ -56,7 +56,7 @@ from qwenmoe.data import download as download_mod
 from qwenmoe.data.dataset import (
     _DEFAULT_CHUNK_SIZE,
     TokenDataset,
-    _as_long_tensor,
+    _as_token_tensor,
     _document_ids,
     _split_into_documents,
     make_fixed_slice,
@@ -89,17 +89,25 @@ assert N == 24
 
 
 # ----------------------------------------------------------------------
-# Part 3 -- _as_long_tensor: the dtype gate.
+# Part 3 -- _as_token_tensor: the dtype gate.
+#
+# Renamed from _as_long_tensor in journal 040, and the semantics changed
+# with it: a tensor now keeps the dtype it arrives in. `prepare_data.py`
+# writes int32, and upcasting a ~1B-token stream to int64 here would
+# double it to ~8GB for no benefit -- TokenDataset.__getitem__ casts each
+# seq_len window instead, which is all the embedding lookup needs. A
+# plain Python list has no dtype to preserve, so it still becomes int64.
 # ----------------------------------------------------------------------
-print("\n================ Part 3 -- _as_long_tensor ================")
-from_list = _as_long_tensor(ALL_TOKENS)
-from_tensor = _as_long_tensor(torch.tensor(ALL_TOKENS, dtype=torch.int32))
+print("\n================ Part 3 -- _as_token_tensor ================")
+from_list = _as_token_tensor(ALL_TOKENS)
+from_tensor = _as_token_tensor(torch.tensor(ALL_TOKENS, dtype=torch.int32))
 print(f"  list  -> {from_list.dtype}, shape {tuple(from_list.shape)}")
-print(f"  int32 tensor -> {from_tensor.dtype}  (cast to long)")
-assert from_list.dtype == torch.long and from_tensor.dtype == torch.long
+print(f"  int32 tensor -> {from_tensor.dtype}  (dtype preserved)")
+assert from_list.dtype == torch.long
+assert from_tensor.dtype == torch.int32
 assert from_list.tolist() == ALL_TOKENS
 
-T = _as_long_tensor(ALL_TOKENS)
+T = _as_token_tensor(ALL_TOKENS)
 
 
 # ----------------------------------------------------------------------

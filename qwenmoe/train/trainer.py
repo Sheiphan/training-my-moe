@@ -16,11 +16,20 @@ the same effective batch as a smaller model it's being compared against).
 """
 from __future__ import annotations
 
+import collections
 import contextlib
+import dataclasses
 import itertools
 import json
 import logging
 import math
+import os
+import resource
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,8 +40,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from qwenmoe.config import ModelConfig, TrainConfig
+from qwenmoe.data.sampler import StepOffsetSampler, strided_eval_offsets
 from qwenmoe.model.transformer import QwenMoEModel
 from qwenmoe.train.optim import build_optimizer
+from qwenmoe.train.scaling import (
+    chinchilla_budget,
+    count_params,
+    epochs_for_budget,
+    moe_budget_note,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -156,10 +172,15 @@ def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: st
 
 
 def _infinite_batches(loader: DataLoader):
-    """Yields batches forever, starting a fresh (re-shuffled, since the
-    loader is built with `shuffle=True`) epoch each time it's exhausted --
-    lets `Trainer` be driven purely by step count
+    """Yields batches forever, so `Trainer` is driven purely by step count
     (`TrainConfig.total_tokens`), not by epoch count.
+
+    Since journal 041 the training loader is driven by `StepOffsetSampler`,
+    which is itself endless, so the `while True` never actually comes
+    around a second time. It's kept because the contract this function
+    provides -- "never raises StopIteration" -- is what the training loop
+    depends on, and that shouldn't silently become the sampler's private
+    responsibility.
     """
     while True:
         yield from loader
@@ -444,6 +465,17 @@ def _evaluate(
     evaluating doesn't require a full pass over a potentially huge
     validation split every `eval_interval_steps`.
 
+    Since journal 041 `val_loader` is driven by `strided_eval_offsets`, so
+    those batches are spread evenly across the whole split rather than
+    being its first `max_eval_batches * batch_size` windows. The cap and
+    the sampler are sized from the same number, so the `islice` below is
+    normally a no-op; it stays as the guard that gives this function its
+    name.
+
+    Deliberately *not* run under `torch.autocast`: measuring validation
+    loss in fp32 keeps it comparable across precision changes and against
+    this project's earlier runs, at a cost of a few seconds per eval.
+
     A `val_loader` over a `TokenDataset(return_segments=True)` yields
     `(x, y, segment_ids)`; the segment ids are forwarded so validation
     perplexity is measured under the same document masking as training
@@ -471,30 +503,264 @@ def _write_log_line(log_file, record: dict) -> None:
     log_file.flush()  # a killed run should still leave a durable, readable log
 
 
+def _format_duration(seconds: float) -> str:
+    """`12d 04h`, `4h 07m`, `7m 12s` -- an ETA measured in days is only
+    misleading when printed to the second."""
+    if not math.isfinite(seconds) or seconds < 0:
+        return "n/a"
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours:02d}h"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m {secs:02d}s"
+
+
+def _rss_bytes() -> int:
+    """Peak resident set size of *this* process. `ru_maxrss` is bytes on
+    macOS and kilobytes on Linux. Journal 040 established the in-process
+    reading as the trustworthy one here: `/usr/bin/time -l` was measuring
+    the `uv` wrapper and reported 2.72GB for a run whose output alone was
+    4GB.
+    """
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return raw if sys.platform == "darwin" else raw * 1024
+
+
+def _mps_allocated_bytes() -> int | None:
+    if not torch.backends.mps.is_available():
+        return None
+    with contextlib.suppress(Exception):
+        return int(torch.mps.current_allocated_memory())
+    return None
+
+
+def _mps_driver_bytes() -> int | None:
+    """Total memory the Metal driver holds, which is *not* the same as
+    `current_allocated_memory` and is the figure that actually decides
+    whether this machine starts swapping (journal 041). Logged separately
+    because watching only the first one is what made journal 037's cliff
+    look like a clean fit right up until the run hung.
+    """
+    if not torch.backends.mps.is_available():
+        return None
+    with contextlib.suppress(Exception):
+        return int(torch.mps.driver_allocated_memory())
+    return None
+
+
+def _git_sha() -> str | None:
+    """The commit the run started from, so a log can be tied back to the
+    code that produced it. Best-effort: a run from a tarball is still a
+    valid run."""
+    with contextlib.suppress(Exception):
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=Path(__file__).resolve().parent,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    return None
+
+
+def _run_start_record(
+    *,
+    model: QwenMoEModel,
+    config: TrainConfig,
+    device: str,
+    total_steps: int,
+    tokens_per_step: int,
+    start_step: int,
+    n_train_windows: int,
+    n_val_windows: int,
+    tokenizer_meta: dict | None,
+    fingerprint: dict,
+) -> dict:
+    """One self-describing record at the head of every run (journal 041).
+
+    `scripts/train.py` already computed most of this and logged it to a
+    console that scrolls away. Putting it in the log instead means the
+    journal entry for a run can be written *from the run*, which is what
+    makes this project's "no fabricated numbers" rule structural rather
+    than a matter of discipline.
+    """
+    breakdown = count_params(model)
+    unique_train_tokens = n_train_windows + config.seq_len
+    return {
+        "type": "run_start",
+        "wall_clock": time.time(),
+        "device": device,
+        "precision": config.precision,
+        "torch_version": torch.__version__,
+        "git_sha": _git_sha(),
+        "start_step": start_step,
+        "total_steps": total_steps,
+        "tokens_per_step": tokens_per_step,
+        "total_tokens": config.total_tokens,
+        "params_total": breakdown.total,
+        "params_active": breakdown.active,
+        "params_embedding": breakdown.embedding,
+        "chinchilla_budget_tokens": chinchilla_budget(breakdown.active),
+        "moe_budget_note": moe_budget_note(breakdown.total, breakdown.active),
+        "epochs_over_train_split": epochs_for_budget(
+            config.total_tokens, unique_train_tokens
+        ),
+        "n_train_windows": n_train_windows,
+        "n_val_windows": n_val_windows,
+        "unique_train_tokens": unique_train_tokens,
+        "data_fingerprint": fingerprint,
+        "tokenizer_meta": tokenizer_meta,
+        "train_config": dataclasses.asdict(config),
+        "model_config": dataclasses.asdict(model.config),
+    }
+
+
+def data_fingerprint(config: TrainConfig, n_train_windows: int) -> dict:
+    """The knobs that, if changed across a resume, would silently corrupt
+    the run rather than fail it (journal 041).
+
+    These are exactly the inputs to `StepOffsetSampler`'s stream and to
+    window indexing: change one and the resumed run draws different data
+    at every step *and* moves the learning-rate schedule under a
+    checkpoint already partway along it, with no error and no visible
+    symptom beyond a worse model. Over a multi-day run with a dozen
+    restarts, mistyping one of these is a question of when, not if.
+
+    `total_tokens` is deliberately **not** here. It changes `total_steps`
+    and therefore the schedule, but changing it is also the *intended* way
+    to extend a run or to size a WSD cooldown -- so it gets a warning
+    rather than a refusal.
+    """
+    return {
+        "seq_len": config.seq_len,
+        "batch_size": config.batch_size,
+        "grad_accum_steps": config.grad_accum_steps,
+        "seed": config.seed,
+        "n_train_windows": n_train_windows,
+    }
+
+
 def save_checkpoint(
     path: str | Path,
     model: QwenMoEModel,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | None,
     model_config: ModelConfig,
     train_config: TrainConfig,
     step: int,
     tokenizer_meta: dict | None,
+    *,
+    total_steps: int | None = None,
+    fingerprint: dict | None = None,
 ) -> None:
     """Model + optimizer + config + step (Requirement 5.4), per design.md's
-    checkpoint format."""
+    checkpoint format, written atomically (journal 041).
+
+    `optimizer=None` writes a **weights-only** checkpoint: enough to
+    generate from, evaluate, or visualize, but not to resume. At ~346M
+    parameters a full checkpoint is `12 bytes x params` (fp32 weights plus
+    AdamW's two moments) = 4.16GB, against 1.39GB weights-only -- which is
+    what makes it affordable to keep a milestone every 20k steps for the
+    whole run.
+
+    The write goes to a `.tmp` sibling and is then `os.replace`d, which is
+    atomic within a filesystem. Without that, a Ctrl-C or a full disk
+    partway through `torch.save` leaves a truncated multi-gigabyte file
+    sitting at exactly the path `--resume-from` will reach for.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "model_config": model_config,
-            "train_config": train_config,
-            "step": step,
-            "tokenizer_meta": tokenizer_meta,
-        },
-        path,
-    )
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+        "model_config": model_config,
+        "train_config": train_config,
+        "step": step,
+        "tokenizer_meta": tokenizer_meta,
+        "total_steps": total_steps,
+        "data_fingerprint": fingerprint,
+    }
+    tmp_path = path.with_name(path.name + ".tmp")
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def estimate_checkpoint_bytes(model: QwenMoEModel, *, with_optimizer: bool) -> int:
+    """Bytes a checkpoint of this model will occupy: 4 per fp32 parameter,
+    plus 8 more for AdamW's `exp_avg`/`exp_avg_sq` when optimizer state is
+    included. Validated against a real file -- `runs/scale_300m`'s
+    `step_100.pt` is 4,013,033,885 bytes against `12 x 334,382,336 =
+    4,012,588,032` predicted, the 445KB difference being pickle framing.
+    """
+    n_params = sum(p.numel() for p in model.parameters())
+    return n_params * (12 if with_optimizer else 4)
+
+
+def prune_checkpoints(
+    checkpoint_dir: Path, *, keep_last: int, keep_every: int, protect: set[Path]
+) -> list[Path]:
+    """Deletes rolling checkpoints that are neither recent nor milestones,
+    and returns what was removed (journal 041).
+
+    Retention is tiered because the two kinds of checkpoint exist for
+    different reasons: rolling ones exist to *resume* and are worthless
+    once a newer one lands, while milestones exist to *evaluate and
+    generate from* across the run's history. Only the first kind needs
+    optimizer state.
+
+    Without this, a 164k-step run at `checkpoint_interval_steps=2000`
+    writes 82 x 4.16GB = 341GB. The run would die on a failed `torch.save`
+    around 18 hours in.
+    """
+    checkpoints: list[tuple[int, Path]] = []
+    for path in checkpoint_dir.glob("step_*.pt"):
+        if path.is_symlink():
+            continue
+        try:
+            checkpoints.append((int(path.stem.removeprefix("step_")), path))
+        except ValueError:
+            continue  # not ours; leave it alone
+    checkpoints.sort()
+
+    recent = {path for _, path in checkpoints[-keep_last:]} if keep_last > 0 else set()
+    milestones = {
+        path for step, path in checkpoints if keep_every > 0 and step % keep_every == 0
+    }
+    keep = recent | milestones | protect
+
+    removed = []
+    for _, path in checkpoints:
+        if path not in keep:
+            path.unlink(missing_ok=True)
+            removed.append(path)
+    return removed
+
+
+def update_latest_pointer(checkpoint_dir: Path, target: Path) -> None:
+    """Points `latest.pt` at `target` via an atomically-replaced relative
+    symlink, so `--resume-from runs/x/checkpoints/latest.pt` works with no
+    change to `load_checkpoint` or `scripts/generate.py`, and `runs/` stays
+    relocatable. Falls back to a copy-free no-op if the filesystem refuses
+    symlinks -- a missing convenience pointer must never fail a run.
+    """
+    link = checkpoint_dir / "latest.pt"
+    tmp = checkpoint_dir / "latest.pt.tmp"
+    try:
+        tmp.unlink(missing_ok=True)
+        tmp.symlink_to(target.name)
+        os.replace(tmp, link)
+    except OSError as exc:
+        logger.warning("could not update %s: %s", link, exc)
+        tmp.unlink(missing_ok=True)
 
 
 def load_checkpoint(path: str | Path) -> dict:
@@ -510,15 +776,173 @@ def load_checkpoint(path: str | Path) -> dict:
 class Trainer:
     """Owns the optimizer/schedule/logging/checkpointing lifecycle around a
     `QwenMoEModel` training run. `output_dir` holds `checkpoints/` (one
-    `step_{N}.pt` file per checkpoint interval) and `logs/train.jsonl`
-    (append-mode, so a resumed run's log history stays contiguous).
+    `step_{N}.pt` file per checkpoint interval, plus a `latest.pt` symlink)
+    and `logs/train.jsonl` (append-mode, so a resumed run's log history
+    stays contiguous).
+
+    `keep_last`/`keep_every` bound what `checkpoints/` costs on disk
+    (journal 041); `0` for either disables that tier, and `keep_last=0`
+    with `keep_every=0` restores the pre-041 behaviour of keeping
+    everything.
     """
 
-    def __init__(self, output_dir: str | Path, tokenizer_meta: dict | None = None) -> None:
+    def __init__(
+        self,
+        output_dir: str | Path,
+        tokenizer_meta: dict | None = None,
+        *,
+        keep_last: int = 0,
+        keep_every: int = 0,
+    ) -> None:
         self.output_dir = Path(output_dir)
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.log_path = self.output_dir / "logs" / "train.jsonl"
         self.tokenizer_meta = tokenizer_meta
+        self.keep_last = keep_last
+        self.keep_every = keep_every
+        self._stop_requested = False
+
+    @contextlib.contextmanager
+    def _graceful_stop(self):
+        """Turns SIGINT/SIGTERM into a flag the training loop checks after
+        its next checkpoint, rather than an exception mid-step.
+
+        Saving from inside the handler is the obvious thing and is how you
+        get a corrupt multi-gigabyte checkpoint: `torch.save` would run
+        with MPS work still in flight and the optimizer possibly halfway
+        through a step. A second signal restores the default handler and
+        re-raises, so an impatient Ctrl-C still works.
+
+        Handlers are restored on the way out -- `Trainer.fit` is called
+        ~20 times by the test suite and from notebooks, and a leaked
+        handler would outlive the run that installed it.
+        """
+        previous: dict[int, object] = {}
+
+        def request_stop(signum, _frame):
+            if self._stop_requested:  # second signal: let it through
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+                return
+            self._stop_requested = True
+            logger.warning(
+                "signal %s received -- finishing this step, then checkpointing and exiting "
+                "(send it again to abort immediately)",
+                signal.Signals(signum).name,
+            )
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                previous[sig] = signal.signal(sig, request_stop)
+            except (ValueError, OSError):
+                pass  # not the main thread; the run just isn't interruptible this way
+        try:
+            yield
+        finally:
+            for sig, handler in previous.items():
+                with contextlib.suppress(ValueError, OSError, TypeError):
+                    signal.signal(sig, handler)
+
+    def _checkpoint(
+        self,
+        *,
+        model: QwenMoEModel,
+        optimizer: torch.optim.Optimizer,
+        config: TrainConfig,
+        step: int,
+        total_steps: int,
+        fingerprint: dict,
+        log_file,
+    ) -> Path | None:
+        """Writes the rolling checkpoint, a weights-only milestone when one
+        is due, repoints `latest.pt`, and prunes (journal 041).
+
+        Returns the rolling checkpoint's path, or `None` if it was skipped
+        for lack of disk. Skipping costs one interval of progress; writing
+        into a full disk costs the run, because `torch.save` raises from
+        inside the training loop and leaves a truncated file behind.
+        """
+        path = self.checkpoint_dir / f"step_{step}.pt"
+        needed = estimate_checkpoint_bytes(model, with_optimizer=True)
+        free = shutil.disk_usage(self.checkpoint_dir).free
+        if free < 2 * needed:
+            logger.error(
+                "skipping checkpoint at step %d: %.1fGB free, need %.1fGB headroom "
+                "(2x the %.1fGB checkpoint). Free disk space or lower --keep-every.",
+                step,
+                free / 1e9,
+                2 * needed / 1e9,
+                needed / 1e9,
+            )
+            _write_log_line(
+                log_file,
+                {
+                    "type": "checkpoint_skipped",
+                    "step": step,
+                    "wall_clock": time.time(),
+                    "free_bytes": free,
+                    "needed_bytes": needed,
+                },
+            )
+            return None
+
+        save_checkpoint(
+            path,
+            model,
+            optimizer,
+            model.config,
+            config,
+            step,
+            self.tokenizer_meta,
+            total_steps=total_steps,
+            fingerprint=fingerprint,
+        )
+        update_latest_pointer(self.checkpoint_dir, path)
+
+        # Milestones carry no optimizer state: at ~346M params that is
+        # 1.39GB against 4.16GB, which is what makes it affordable to keep
+        # one every `keep_every` steps for a whole multi-day run.
+        milestone: Path | None = None
+        if self.keep_every > 0 and step % self.keep_every == 0:
+            milestone = self.checkpoint_dir / f"milestone_{step}.pt"
+            save_checkpoint(
+                milestone,
+                model,
+                None,
+                model.config,
+                config,
+                step,
+                self.tokenizer_meta,
+                total_steps=total_steps,
+                fingerprint=fingerprint,
+            )
+
+        if self.keep_last > 0:
+            removed = prune_checkpoints(
+                self.checkpoint_dir,
+                keep_last=self.keep_last,
+                keep_every=0,  # milestones live under their own prefix
+                protect={path},
+            )
+            if removed:
+                logger.info(
+                    "pruned %d old checkpoint(s): %s",
+                    len(removed),
+                    ", ".join(p.name for p in removed),
+                )
+        _write_log_line(
+            log_file,
+            {
+                "type": "checkpoint",
+                "step": step,
+                "wall_clock": time.time(),
+                "path": str(path),
+                "milestone": str(milestone) if milestone else None,
+                "bytes": path.stat().st_size if path.exists() else None,
+                "free_bytes_after": shutil.disk_usage(self.checkpoint_dir).free,
+            },
+        )
+        return path
 
     def fit(
         self,
@@ -527,6 +951,8 @@ class Trainer:
         val_dataset: Dataset,
         config: TrainConfig,
         resume_from: str | Path | None = None,
+        *,
+        allow_schedule_change: bool = False,
     ) -> TrainResult:
         if len(train_dataset) < config.batch_size:
             raise ValueError(
@@ -565,13 +991,7 @@ class Trainer:
         model = model.to(device)
         optimizer = build_optimizer(model, config)
 
-        global_step = 0
-        if resume_from is not None:
-            checkpoint = load_checkpoint(resume_from)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            _move_optimizer_state_to_device(optimizer, device)
-            global_step = checkpoint["step"]
+        fingerprint = data_fingerprint(config, len(train_dataset))
 
         # Gradient accumulation (moe-modernization follow-up, journal 038):
         # each optimizer step consumes `grad_accum_steps` micro-batches, so
@@ -580,12 +1000,83 @@ class Trainer:
         # (the default) reduces this to the pre-existing formula exactly.
         effective_batch_size = config.batch_size * config.grad_accum_steps
         total_steps = max(1, config.total_tokens // (effective_batch_size * config.seq_len))
+        tokens_per_step = effective_batch_size * config.seq_len
+        # A stride-1 dataset has one window per token position, so the
+        # unique token count is the window count plus the final window's
+        # tail -- this is what `epoch` in the step log is measured against.
+        unique_train_tokens = len(train_dataset) + config.seq_len
 
+        global_step = 0
+        if resume_from is not None:
+            checkpoint = load_checkpoint(resume_from)
+            if checkpoint.get("optimizer_state_dict") is None:
+                raise ValueError(
+                    f"{resume_from} is a weights-only milestone checkpoint and carries no "
+                    "optimizer state, so a run cannot be continued from it. Resume from "
+                    "checkpoints/latest.pt (or another full checkpoint) instead."
+                )
+            saved_fingerprint = checkpoint.get("data_fingerprint")
+            if (
+                saved_fingerprint is not None
+                and saved_fingerprint != fingerprint
+                and not allow_schedule_change
+            ):
+                changed = {
+                    key: (saved_fingerprint.get(key), fingerprint.get(key))
+                    for key in fingerprint
+                    if saved_fingerprint.get(key) != fingerprint.get(key)
+                }
+                raise ValueError(
+                    "resuming with different data settings would re-align the data stream "
+                    "and move the learning-rate schedule under a partly-trained checkpoint. "
+                    f"Changed (was -> now): {changed}. Pass allow_schedule_change=True "
+                    "(--allow-schedule-change) if this is deliberate."
+                )
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            _move_optimizer_state_to_device(optimizer, device)
+            global_step = checkpoint["step"]
+            saved_total_steps = checkpoint.get("total_steps")
+            if saved_total_steps is not None and saved_total_steps != total_steps:
+                # Not an error: extending a run and sizing a WSD cooldown
+                # both work exactly this way. But the schedule a resumed
+                # step sits on has moved, so say so out loud.
+                logger.warning(
+                    "total_steps changed across resume (%d -> %d): the learning-rate "
+                    "schedule has been re-sized, so step %d now sits at %.1f%% of the "
+                    "schedule instead of %.1f%%.",
+                    saved_total_steps,
+                    total_steps,
+                    global_step,
+                    100 * global_step / total_steps,
+                    100 * global_step / saved_total_steps,
+                )
+
+        # journal 041: offsets drawn per optimizer step, not a permutation
+        # of every window. `start_step=global_step` is the whole of the
+        # resume fix -- it must therefore be built *after* the resume block
+        # above has restored `global_step`.
+        train_sampler = StepOffsetSampler(
+            len(train_dataset),
+            batch_size=config.batch_size,
+            grad_accum_steps=config.grad_accum_steps,
+            seed=config.seed,
+            start_step=global_step,
+        )
         train_loader = DataLoader(
-            train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True
+            train_dataset,
+            batch_size=config.batch_size,
+            sampler=train_sampler,
+            drop_last=True,
+            num_workers=0,  # workers prefetch ahead of the loop, breaking resume alignment
         )
         val_loader = DataLoader(
-            val_dataset, batch_size=config.batch_size, shuffle=False, drop_last=True
+            val_dataset,
+            batch_size=config.batch_size,
+            sampler=strided_eval_offsets(
+                len(val_dataset), config.max_eval_batches * config.batch_size
+            ),
+            drop_last=True,
         )
         train_iter = _infinite_batches(train_loader)
 
@@ -596,8 +1087,24 @@ class Trainer:
         final_val_loss = math.nan
         final_val_ppl = math.nan
         checkpoint_path: Path | None = None
+        recent_elapsed: collections.deque[float] = collections.deque(maxlen=50)
 
-        with self.log_path.open("a", encoding="utf-8") as log_file:
+        with self.log_path.open("a", encoding="utf-8") as log_file, self._graceful_stop():
+            _write_log_line(
+                log_file,
+                _run_start_record(
+                    model=model,
+                    config=config,
+                    device=device,
+                    total_steps=total_steps,
+                    tokens_per_step=tokens_per_step,
+                    start_step=global_step,
+                    n_train_windows=len(train_dataset),
+                    n_val_windows=len(val_dataset),
+                    tokenizer_meta=self.tokenizer_meta,
+                    fingerprint=fingerprint,
+                ),
+            )
             while global_step < total_steps:
                 # One optimizer step consumes `grad_accum_steps` micro-batches
                 # (moe-modernization follow-up, journal 038); with the default
@@ -615,6 +1122,7 @@ class Trainer:
                     micro_batches.append((x, y, segment_ids))
 
                 step_start = time.perf_counter()
+                device_before = device
                 metrics, grad_norm, current_lr, device, model, expert_counts = _run_step(
                     model,
                     optimizer,
@@ -624,18 +1132,54 @@ class Trainer:
                     total_steps,
                     config,
                 )
+                if device != device_before:
+                    # `_run_step` drops to cpu on an mps RuntimeError and
+                    # logs a warning. On an unattended multi-day run that
+                    # warning scrolls away and the run silently continues
+                    # at roughly 1% speed, which is the worst available
+                    # failure mode (journal 041) -- so it goes in the log
+                    # too, where the watcher can alert on it.
+                    _write_log_line(
+                        log_file,
+                        {
+                            "type": "device_fallback",
+                            "step": global_step,
+                            "wall_clock": time.time(),
+                            "from": device_before,
+                            "to": device,
+                        },
+                    )
+                # journal 041: MPS's caching allocator holds freed blocks,
+                # and across steps `driver_allocated_memory` climbs without
+                # bound even while `current_allocated_memory` stays flat --
+                # measured 9.5GB -> 20.5GB over four steps at seq_len 512,
+                # with step time going 2.8s -> 17.9s -> 177s as the machine
+                # started swapping. Releasing the cache each step pins the
+                # driver figure (12.4GB, flat) for no measurable step cost.
+                # This is the cliff journal 037 hit and could only describe
+                # as "hung": `current_allocated_memory` never showed it,
+                # which is why `check_capacity.py` called it a clean fit.
+                if device == "mps":
+                    torch.mps.empty_cache()
                 elapsed = time.perf_counter() - step_start
 
                 global_step += 1
+                recent_elapsed.append(elapsed)
                 train_loss = metrics["lm_loss"]
                 aux_loss_value = metrics["aux_loss"]
                 final_train_loss = train_loss
                 is_last_step = global_step == total_steps
+                tokens_seen = global_step * tokens_per_step
 
                 if global_step % config.log_interval_steps == 0 or is_last_step:
+                    # Median over a rolling window, not the last step alone:
+                    # a single slow step (an eval, a checkpoint, a thermal
+                    # blip) shouldn't move the ETA by hours.
+                    median_elapsed = statistics.median(recent_elapsed)
+                    tokens_per_sec = tokens_per_step / elapsed if elapsed > 0 else None
                     logger.info(
                         "step %d/%d | loss %.4f | aux_loss %s | z_loss %s | mtp_loss %s "
-                        "| lr %.2e | elapsed %.3fs",
+                        "| lr %.2e | elapsed %.3fs | %s tok/s | eta %s",
                         global_step,
                         total_steps,
                         train_loss,
@@ -644,6 +1188,8 @@ class Trainer:
                         "n/a" if metrics["mtp_loss"] is None else f"{metrics['mtp_loss']:.4f}",
                         current_lr,
                         elapsed,
+                        "n/a" if tokens_per_sec is None else f"{tokens_per_sec:,.0f}",
+                        _format_duration((total_steps - global_step) * median_elapsed),
                     )
                     _write_log_line(
                         log_file,
@@ -658,6 +1204,19 @@ class Trainer:
                             "lr": current_lr,
                             "grad_norm": grad_norm,
                             "elapsed_s": elapsed,
+                            # journal 041: `elapsed_s` alone can't tell "the
+                            # run was down for six hours" from "these steps
+                            # were slow" -- on a multi-day run that is the
+                            # distinction that matters most.
+                            "wall_clock": time.time(),
+                            "tokens": tokens_seen,
+                            "tokens_per_sec": tokens_per_sec,
+                            "eta_s": (total_steps - global_step) * median_elapsed,
+                            "rss_bytes": _rss_bytes(),
+                            "mps_allocated_bytes": _mps_allocated_bytes(),
+                            "mps_driver_bytes": _mps_driver_bytes(),
+                            "device": device,  # changes if the cpu fallback fires
+                            "epoch": tokens_seen / unique_train_tokens,
                             # Summed across the accumulation window by
                             # `_run_step` (`_sum_expert_counts`), not just the
                             # last micro-batch's reading.
@@ -681,22 +1240,47 @@ class Trainer:
                         {
                             "type": "eval",
                             "step": global_step,
+                            "tokens": tokens_seen,
+                            "wall_clock": time.time(),
                             "val_loss": final_val_loss,
                             "val_perplexity": final_val_ppl,
                         },
                     )
 
-                if global_step % config.checkpoint_interval_steps == 0 or is_last_step:
-                    checkpoint_path = self.checkpoint_dir / f"step_{global_step}.pt"
-                    save_checkpoint(
-                        checkpoint_path,
-                        model,
-                        optimizer,
-                        model.config,
-                        config,
-                        global_step,
-                        self.tokenizer_meta,
+                due_for_checkpoint = (
+                    global_step % config.checkpoint_interval_steps == 0
+                    or is_last_step
+                    or self._stop_requested
+                )
+                if due_for_checkpoint:
+                    saved = self._checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        config=config,
+                        step=global_step,
+                        total_steps=total_steps,
+                        fingerprint=fingerprint,
+                        log_file=log_file,
                     )
+                    checkpoint_path = saved or checkpoint_path
+
+                if self._stop_requested:
+                    logger.warning(
+                        "stopping at step %d/%d on request; checkpoint written",
+                        global_step,
+                        total_steps,
+                    )
+                    _write_log_line(
+                        log_file,
+                        {
+                            "type": "interrupt",
+                            "step": global_step,
+                            "tokens": tokens_seen,
+                            "wall_clock": time.time(),
+                            "checkpoint": str(checkpoint_path) if checkpoint_path else None,
+                        },
+                    )
+                    break
 
         return TrainResult(
             final_step=global_step,

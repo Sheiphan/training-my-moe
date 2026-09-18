@@ -19,7 +19,7 @@ opposite trade-off: **maximum detail, minimum summarising**. We
 1. fix **one** tiny corpus — four toy "documents" packed into a single
    flat stream of 24 token ids — and one small configuration,
 2. push it through **every single line** of `qwenmoe/data/dataset.py`:
-   `_as_long_tensor`, `_document_ids`, `TokenDataset.__init__` /
+   `_as_token_tensor`, `_document_ids`, `TokenDataset.__init__` /
    `__len__` / `__getitem__`, `_split_into_documents`, `train_val_split`
    (both modes), and `make_fixed_slice`, citing `dataset.py:line` at each
    step,
@@ -242,38 +242,43 @@ From here on, assume the raw text has been downloaded and tokenised into
 
 ---
 
-## Part 3 — `_as_long_tensor`: the dtype gate
+## Part 3 — `_as_token_tensor`: the dtype gate
 
-Source: [`dataset.py:19–22`](../../qwenmoe/data/dataset.py#L19).
+Source: [`dataset.py:19–27`](../../qwenmoe/data/dataset.py#L19).
 
 ```python
-def _as_long_tensor(tokens: list[int] | Tensor) -> Tensor:
+def _as_token_tensor(tokens: list[int] | Tensor) -> Tensor:
     if isinstance(tokens, Tensor):
-        return tokens.to(dtype=torch.long)
+        return tokens
     return torch.tensor(tokens, dtype=torch.long)
 ```
 
 **Why it exists.** Every downstream function accepts *either* a Python
-list *or* an existing tensor, and must not care which. And the result
-**must** be `torch.long`: token ids index the embedding table, and
-PyTorch requires an integer index tensor. A `float` tensor, or the
-platform-dependent default int, would crash the model much later with a
-confusing error; forcing the dtype here makes the guarantee local.
+list *or* an existing tensor, and must not care which.
 
-- **`isinstance(tokens, Tensor)`** — "is this already a tensor?"
-- **`.to(dtype=torch.long)`** — return a copy converted to 64-bit int (a
-  no-op if it already is).
+> **Changed in journal 040.** This was `_as_token_tensor`, and it forced
+> *every* input to `torch.long`. That was correct when a corpus was 1MB
+> and wrong at a billion tokens: `scripts/prepare_data.py` writes `int32`,
+> and upcasting the whole stream here would double a 4GB tensor to 8GB
+> for no benefit. Token ids do still have to be `int64` when they reach
+> `nn.Embedding` — but only the `seq_len` positions actually being looked
+> up, which is why `TokenDataset.__getitem__` now casts per window
+> instead. An incoming tensor therefore keeps its dtype; a Python list
+> has none to keep, so it still becomes `int64`.
+
+- **`isinstance(tokens, Tensor)`** — "is this already a tensor?" If so,
+  hand it back untouched.
 - **`torch.tensor(tokens, dtype=torch.long)`** — build a fresh 1-D tensor
   from the list, as 64-bit int.
 
-**Computed.** `_as_long_tensor(ALL_TOKENS)` takes the list branch:
+**Computed.** `_as_token_tensor(ALL_TOKENS)` takes the list branch:
 
 $$
 [3,1,4,1,0,\dots,4] \;\longrightarrow\; \texttt{tensor}([3,1,4,1,0,\dots,4],\ \texttt{dtype=int64})
 $$
 
 Shape `(24,)`, dtype `torch.long`. Feeding it an `int32` tensor instead
-takes the first branch and still comes back `int64`. Both checked.
+takes the first branch and comes back **still `int32`**. Both checked.
 
 **Ledger:** list (len 24) → tensor `(24,)`, `int64`. Call this tensor
 $T$.
@@ -289,7 +294,7 @@ Source: [`dataset.py:105–131`](../../qwenmoe/data/dataset.py#L105) (the
 def train_val_split(tokens, val_fraction=0.1, *, mode="tail", eos_id=None):
     if not 0.0 < val_fraction < 1.0:
         raise ValueError(...)
-    tokens = _as_long_tensor(tokens)
+    tokens = _as_token_tensor(tokens)
     if mode == "tail":
         n_val = int(tokens.numel() * val_fraction)
         n_train = tokens.numel() - n_val
@@ -618,7 +623,7 @@ if seq_len < 1:
     raise ValueError(...)                                  # (a)
 if return_segments and eos_id is None:
     raise ValueError(...)                                  # (b)
-tokens = _as_long_tensor(tokens)
+tokens = _as_token_tensor(tokens)
 if tokens.numel() < seq_len + 1:
     raise ValueError(...)                                  # (c)
 self._tokens = tokens
@@ -769,7 +774,7 @@ Source: [`dataset.py:162–185`](../../qwenmoe/data/dataset.py#L162).
 def make_fixed_slice(all_tokens, n_tokens, seed) -> Tensor:
     if n_tokens < 1:
         raise ValueError(...)
-    all_tokens = _as_long_tensor(all_tokens)
+    all_tokens = _as_token_tensor(all_tokens)
     if n_tokens > all_tokens.numel():
         raise ValueError(...)
     chunk_size = max(1, min(_DEFAULT_CHUNK_SIZE, all_tokens.numel() // 4))
@@ -1052,7 +1057,7 @@ All assertions passed -- every number in 008-data-pipeline.md is real.
 | after | object | shape | notes |
 |---|---|---|---|
 | input | `ALL_TOKENS` | `(24,)` list | 4 documents, `eos_id = 0` at idx 4/10/15 |
-| `_as_long_tensor` | $T$ | `(24,)` `int64` | |
+| `_as_token_tensor` | $T$ | `(24,)` `int64` | |
 | `make_fixed_slice(·, 20, seed=1)` | `sliced` | `(20,)` | 4 chunks of 6, order `[1,3,2,0]`, first 20 kept |
 | `train_val_split(·, 0.25)` | `train`, `val` | `(15,)`, `(5,)` | contiguous tail cut |
 | `TokenDataset(train, 4)` | dataset | len `11` | `N − seq_len` |
@@ -1071,7 +1076,7 @@ Using this example's own numbers.
 
 | function | work on our example | asymptotic |
 |---|---|---|
-| `_as_long_tensor` | copy/cast 24 ints | $O(N)$ |
+| `_as_token_tensor` | copy/cast 24 ints | $O(N)$ |
 | `train_val_split` (tail) | one multiply, one subtract, two slices (views) | $O(1)$ + $O(N)$ to materialise |
 | `train_val_split` (documents) | one scan for separators + one reverse walk | $O(N + D)$, $D$ = #documents |
 | `_document_ids` | one shift + one cumsum | $O(N)$ |

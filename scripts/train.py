@@ -20,6 +20,20 @@ synthetic children's stories, journal 039):
     uv run python scripts/train.py --preset SCALE_300M --corpus fineweb_edu \\
         --tokenizer-type bpe --bpe-vocab-size 4096 --total-tokens 200000000 \\
         --output-dir runs/fineweb_300m
+
+Usage (a real multi-day run -- WSD so it can be stopped whenever you like
+and still finish properly, bounded checkpoints so it can't fill the disk,
+journal 041):
+    uv run python scripts/train.py --preset SCALE_300M --corpus fineweb_edu \\
+        --tokenizer-type bpe --bpe-vocab-size 16384 --corpus-chars 3500000000 \\
+        --batch-size 4 --grad-accum-steps 8 --seq-len 512 \\
+        --lr-schedule wsd --warmup-steps 2000 --val-fraction 0.005 \\
+        --checkpoint-interval-steps 2000 --keep-last 2 --keep-every 20000 \\
+        --total-tokens 2700000000 --output-dir runs/fineweb_300m
+
+    # ...then, whenever you decide to stop, cool down into a finished model:
+    uv run python scripts/train.py ... --resume-from runs/fineweb_300m/checkpoints/latest.pt \\
+        --total-tokens <tokens-already-seen * 1.25> --allow-schedule-change
 """
 from __future__ import annotations
 
@@ -57,7 +71,14 @@ def _load_prepared_data(config: DataConfig) -> tuple[torch.Tensor, dict]:
             f"--tokenizer-type {config.tokenizer_type}' first"
         )
 
-    tokens = torch.load(tokens_path, weights_only=True)
+    # mmap: the token stream is read-only and randomly indexed, so it
+    # belongs in evictable page cache rather than in 4GB of dirty
+    # anonymous memory (journal 041). Measured on the real 999M-token
+    # file: 0.014s and 0.20GB RSS, against 4.11GB resident without it.
+    # `train_val_split(mode="tail")` returns views, so the mapping
+    # survives the split; `mode="documents"` would `torch.cat` and
+    # defeat it.
+    tokens = torch.load(tokens_path, weights_only=True, mmap=True)
     tokenizer = build_tokenizer(config)
     tokenizer.load(tokenizer_path)
     tokenizer_meta = {
@@ -69,6 +90,26 @@ def _load_prepared_data(config: DataConfig) -> tuple[torch.Tensor, dict]:
         "eos_id": getattr(tokenizer, "eos_id", None),
     }
     return tokens, tokenizer_meta
+
+
+def _build_train_config(args: argparse.Namespace) -> TrainConfig:
+    """Builds `TrainConfig` from whichever argparse destinations share a
+    name with one of its fields.
+
+    Written this way on purpose (journal 041). The previous hand-written
+    constructor passed 12 of 24 fields, so `precision`, `lr_schedule`,
+    `weight_decay`, `z_loss_weight` and the rest silently took their
+    dataclass defaults no matter what was on the command line -- a bug
+    that is invisible until you go looking for why a run wasn't using
+    bf16. Matching on field names means adding a flag is enough to wire
+    it up, and adding a `TrainConfig` field without a flag is a
+    deliberate choice rather than an oversight.
+    """
+    fields = {f.name for f in dataclasses.fields(TrainConfig)}
+    kwargs = {name: value for name, value in vars(args).items() if name in fields}
+    # argparse gives a list for nargs=2; TrainConfig validates a tuple.
+    kwargs["betas"] = tuple(args.betas)
+    return TrainConfig(**kwargs)
 
 
 def main() -> None:
@@ -126,6 +167,80 @@ def main() -> None:
         help="block attention across packed-document boundaries "
         "(moe-modernization Requirement 10.2; needs data prepared with --split-documents)",
     )
+
+    # -- optimizer / schedule / precision (journal 041). `TrainConfig`
+    # supported every one of these already; only the CLI didn't pass them,
+    # so a run silently took the dataclass default.
+    schedule = parser.add_argument_group("optimizer, schedule and precision")
+    schedule.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw")
+    schedule.add_argument(
+        "--lr-schedule",
+        choices=["cosine", "wsd"],
+        default="cosine",
+        help="'wsd' holds lr flat then decays over the final --decay-fraction "
+        "(journal 019), so a checkpoint anywhere in the plateau is a valid "
+        "launch point for a short cooldown -- which is what lets a long run be "
+        "stopped when you choose and still finish properly",
+    )
+    schedule.add_argument("--min-lr-ratio", type=float, default=0.1)
+    schedule.add_argument("--decay-fraction", type=float, default=0.2)
+    schedule.add_argument(
+        "--precision",
+        choices=["fp32", "bf16"],
+        default="fp32",
+        help="'bf16' runs the forward pass under torch.autocast; loss and "
+        "z-loss stay fp32. Unmeasured on MPS -- calibrate before trusting it",
+    )
+    schedule.add_argument("--weight-decay", type=float, default=0.1)
+    schedule.add_argument("--grad-clip-norm", type=float, default=1.0)
+    schedule.add_argument(
+        "--z-loss-weight",
+        type=float,
+        default=0.0,
+        help="penalty on logsumexp(logits)^2; ~1e-4 keeps logit scale in "
+        "check, and matters more under bf16 (journal 024)",
+    )
+    schedule.add_argument("--adam-eps", type=float, default=1e-8)
+    schedule.add_argument(
+        "--betas",
+        type=float,
+        nargs=2,
+        metavar=("BETA1", "BETA2"),
+        default=[0.9, 0.95],
+    )
+    schedule.add_argument("--muon-lr", type=float, default=None)
+    schedule.add_argument("--muon-momentum", type=float, default=0.95)
+
+    # -- long-run machinery (journal 041)
+    longrun = parser.add_argument_group("long-run machinery")
+    longrun.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.1,
+        help="fraction of tokens held out for validation. The 0.1 default is "
+        "~100M tokens on the full FineWeb-Edu corpus, far more than any eval "
+        "needs; 0.005 returns ~95M tokens to training at no cost to eval quality",
+    )
+    longrun.add_argument(
+        "--keep-last",
+        type=int,
+        default=0,
+        help="full (resumable) checkpoints to retain; 0 keeps every one, which "
+        "at 4.16GB each fills a disk on a multi-day run",
+    )
+    longrun.add_argument(
+        "--keep-every",
+        type=int,
+        default=0,
+        help="also write a weights-only milestone every N steps (1.39GB vs "
+        "4.16GB), which retention never prunes",
+    )
+    longrun.add_argument(
+        "--allow-schedule-change",
+        action="store_true",
+        help="permit resuming with different data settings (batch size, seq "
+        "len, seed); needed deliberately for a WSD cooldown",
+    )
     args = parser.parse_args()
 
     data_config = DataConfig(
@@ -145,7 +260,7 @@ def main() -> None:
         )
 
     train_tokens, val_tokens = train_val_split(
-        tokens, mode=args.val_split_mode, eos_id=eos_id
+        tokens, val_fraction=args.val_fraction, mode=args.val_split_mode, eos_id=eos_id
     )
     segment_kwargs = dict(return_segments=args.document_masking, eos_id=eos_id)
     train_dataset = TokenDataset(train_tokens, args.seq_len, **segment_kwargs)
@@ -159,21 +274,7 @@ def main() -> None:
         max_seq_len=max(getattr(presets, args.preset).max_seq_len, args.seq_len),
     )
 
-    train_config = TrainConfig(
-        batch_size=args.batch_size,
-        grad_accum_steps=args.grad_accum_steps,
-        seq_len=args.seq_len,
-        total_tokens=args.total_tokens,
-        lr=args.lr,
-        warmup_steps=args.warmup_steps,
-        eval_interval_steps=args.eval_interval_steps,
-        max_eval_batches=args.max_eval_batches,
-        checkpoint_interval_steps=args.checkpoint_interval_steps,
-        log_interval_steps=args.log_interval_steps,
-        device=args.device,
-        seed=args.seed,
-        document_masking=args.document_masking,
-    )
+    train_config = _build_train_config(args)
 
     torch.manual_seed(args.seed)
     model = QwenMoEModel(model_config)
@@ -208,8 +309,20 @@ def main() -> None:
             args.batch_size * args.grad_accum_steps,
         )
 
-    trainer = Trainer(args.output_dir, tokenizer_meta=tokenizer_meta)
-    result = trainer.fit(model, train_dataset, val_dataset, train_config, resume_from=args.resume_from)
+    trainer = Trainer(
+        args.output_dir,
+        tokenizer_meta=tokenizer_meta,
+        keep_last=args.keep_last,
+        keep_every=args.keep_every,
+    )
+    result = trainer.fit(
+        model,
+        train_dataset,
+        val_dataset,
+        train_config,
+        resume_from=args.resume_from,
+        allow_schedule_change=args.allow_schedule_change,
+    )
 
     logger.info(
         "done: step=%d train_loss=%.4f val_loss=%.4f val_perplexity=%.4f",
