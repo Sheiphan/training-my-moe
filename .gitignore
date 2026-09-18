@@ -20,3 +20,6 @@ media/
 
 # Training checkpoints + JSON-lines logs (regeneratable via scripts/train.py)
 runs/
+
+# Video/episode script planning (not part of the model/docs deliverables)
+content/

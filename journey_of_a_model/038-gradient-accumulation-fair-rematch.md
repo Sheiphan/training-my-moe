@@ -2,6 +2,12 @@
 
 **Type:** tooling + experiment (direct follow-up to 037, not a spec task) · **Date:** 2026-09-05
 
+> **Full derivation:** [`docs/math/038-gradient-accumulation-fair-rematch.md`](../docs/math/038-gradient-accumulation-fair-rematch.md)
+> — the token-counting arithmetic below, solved digit by digit, plus the
+> piece this entry's own "trickiest test" note only summarizes: a full
+> proof of *why* the auxiliary MoE loss (unlike cross-entropy) does not
+> decompose across accumulated micro-batches, matched to real numbers.
+
 ## TL;DR
 
 - **The question:** entry 037's tables show `SCALE_300M` at step 500 (val_loss
