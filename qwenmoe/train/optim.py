@@ -262,6 +262,32 @@ class CombinedOptimizer:
             opt.load_state_dict(sub_state)
 
 
+_FUSED_ADAMW_DEVICES = ("cuda", "cpu", "xpu")
+
+
+def _fused_adamw_supported(params: list[nn.Parameter]) -> bool:
+    """Whether `torch.optim.AdamW(fused=True)` can take these parameters.
+
+    Worth the check rather than a flag, because the default AdamW path
+    costs **one host-device synchronization per parameter, per step**:
+    `_get_value(step)` in `torch/optim/optimizer.py` calls `.item()` on each
+    parameter's step counter. Measured on `SCALE_300M`'s shape (10 layers,
+    ~339 parameters) that was **339 of the 362 syncs in an entire optimizer
+    step** -- an order of magnitude more than every sync in the trainer and
+    the MoE dispatch combined, and invisible in the trainer's own source
+    because it happens inside `optimizer.step()`.
+
+    The fused path keeps the step counter on-device and does the whole
+    update in one kernel: measured **0** `.item()` calls. Not available on
+    MPS, which is why this is a capability probe and not a config flag --
+    the laptop path keeps exactly the optimizer it had.
+    """
+    if not params:
+        return False
+    devices = {p.device.type for p in params}
+    return len(devices) == 1 and devices.pop() in _FUSED_ADAMW_DEVICES
+
+
 def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimizer:
     """Constructs the optimizer named by `config.optimizer` (Requirement
     1.4-1.5), with weight decay applied only to the `decay` group
@@ -276,7 +302,13 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimi
             {"params": no_decay, "weight_decay": 0.0, "base_lr": config.lr},
         ]
         groups = [g for g in groups if g["params"]]  # AdamW rejects an empty param list
-        return torch.optim.AdamW(groups, lr=config.lr, betas=config.betas, eps=config.adam_eps)
+        return torch.optim.AdamW(
+            groups,
+            lr=config.lr,
+            betas=config.betas,
+            eps=config.adam_eps,
+            fused=_fused_adamw_supported(decay + no_decay) or None,
+        )
 
     if config.optimizer == "muon":
         muon_params, adamw_params = split_muon_adamw_params(model)
@@ -293,7 +325,11 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimi
         ]
         adamw_groups = [g for g in adamw_groups if g["params"]]
         adamw_opt = torch.optim.AdamW(
-            adamw_groups, lr=config.lr, betas=config.betas, eps=config.adam_eps
+            adamw_groups,
+            lr=config.lr,
+            betas=config.betas,
+            eps=config.adam_eps,
+            fused=_fused_adamw_supported(adamw_decay + adamw_no_decay) or None,
         )
 
         muon_lr = config.muon_lr if config.muon_lr is not None else config.lr

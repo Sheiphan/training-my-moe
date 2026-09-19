@@ -139,3 +139,34 @@ def test_save_load_round_trips_the_eos_flag(tmp_path):
     loaded.load(path)
     assert loaded.eos_id == tok.eos_id
     assert loaded.vocab_size == tok.vocab_size
+
+
+# -- _count_pairs, the reference counting step (journal 042) ------------------
+
+
+def test_count_pairs_counts_adjacent_pairs():
+    from qwenmoe.tokenizer.bpe import _count_pairs
+
+    assert _count_pairs([1, 2, 1, 2, 3]) == {(1, 2): 2, (2, 1): 1, (2, 3): 1}
+
+
+def test_count_pairs_on_short_sequences():
+    from qwenmoe.tokenizer.bpe import _count_pairs
+
+    assert _count_pairs([]) == {}
+    assert _count_pairs([7]) == {}
+
+
+def test_count_pairs_agrees_with_the_trainers_weighted_counting():
+    """The reference form and the trainer's frequency-weighted form must
+    agree on a single unweighted sequence -- that equivalence is what makes
+    the simple one honest to teach first."""
+    from collections import Counter
+
+    from qwenmoe.tokenizer.bpe import _count_pairs
+
+    ids = [5, 9, 5, 9, 4, 5, 9]
+    weighted = Counter()
+    for pair in zip(ids, ids[1:]):
+        weighted[pair] += 1  # frequency 1, one chunk
+    assert _count_pairs(ids) == dict(weighted)

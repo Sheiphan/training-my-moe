@@ -314,3 +314,58 @@ def test_combined_optimizer_state_dict_round_trips():
     fresh_optimizer.load_state_dict(state)  # must not raise
 
     assert len(fresh_optimizer.state) == len(optimizer.state)
+
+
+# -- fused AdamW (journal 043) -----------------------------------------------
+
+
+def test_fused_adamw_supported_probe_matches_device():
+    from qwenmoe.train.optim import _fused_adamw_supported
+
+    cpu_params = [torch.nn.Parameter(torch.zeros(2, 2))]
+    assert _fused_adamw_supported(cpu_params) is True
+    assert _fused_adamw_supported([]) is False
+
+
+def test_build_optimizer_enables_fused_adamw_on_cpu():
+    """The default AdamW path costs one host-device sync per parameter per
+    step, inside `optimizer.step()` where the trainer's own source can't
+    show it. On SCALE_300M's shape that was 339 of 362 syncs per step."""
+    model = QwenMoEModel(_tiny_model_config())
+    opt = build_optimizer(model, _tiny_train_config(optimizer="adamw"))
+    assert all(group.get("fused") for group in opt.param_groups)
+
+
+def test_fused_adamw_eliminates_per_parameter_syncs():
+    """Counts the syncs rather than asserting the flag -- this is the
+    property that actually matters, and it is measurable."""
+    model = QwenMoEModel(_tiny_model_config())
+    opt = build_optimizer(model, _tiny_train_config(optimizer="adamw"))
+    model(torch.zeros(2, 8, dtype=torch.long))[0].square().mean().backward()
+    opt.step()  # warm up: first step allocates optimizer state
+
+    calls = 0
+    real_item = torch.Tensor.item
+
+    def counting_item(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_item(self, *args, **kwargs)
+
+    model(torch.zeros(2, 8, dtype=torch.long))[0].square().mean().backward()
+    torch.Tensor.item = counting_item
+    try:
+        opt.step()
+    finally:
+        torch.Tensor.item = real_item
+    assert calls == 0, f"fused AdamW should not synchronize, saw {calls} .item() calls"
+
+
+def test_fused_adamw_still_trains():
+    """A fused kernel that silently no-ops would pass the sync test."""
+    model = QwenMoEModel(_tiny_model_config())
+    opt = build_optimizer(model, _tiny_train_config(optimizer="adamw"))
+    before = model.final_norm.weight.detach().clone()
+    model(torch.zeros(2, 8, dtype=torch.long))[0].square().mean().backward()
+    opt.step()
+    assert not torch.equal(before, model.final_norm.weight)

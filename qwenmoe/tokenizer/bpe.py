@@ -65,6 +65,29 @@ _PRE_TOKEN_PATTERN = re.compile(
 )
 
 
+def _count_pairs(ids: list[int]) -> dict[tuple[int, int], int]:
+    """Counts every adjacent pair in one token sequence.
+
+    This is the textbook statement of BPE's counting step (Sennrich et al.,
+    2016) and the form `docs/math/007-tokenizers.md` walks through by hand.
+    `train` does not call it: since journal 039 the trainer counts pairs
+    *frequency-weighted across unique pre-token chunks* and maintains a
+    pair -> chunk index so each merge only revisits affected chunks, which
+    is what turned an `O(corpus x merges)` trainer into one usable on a
+    3.5B-character corpus. The two agree on a single unweighted sequence,
+    which is what makes this the honest reference form to explain first.
+
+    Restored in journal 042: the 039 rewrite deleted it and left
+    `docs/math/verify_007_tokenizers.py` unable to import, so a doc whose
+    whole premise is "every number here is reproducible" had no runnable
+    proof for two entries.
+    """
+    counts: dict[tuple[int, int], int] = {}
+    for pair in zip(ids, ids[1:]):
+        counts[pair] = counts.get(pair, 0) + 1
+    return counts
+
+
 def _merge_pair(ids: list[int], pair: tuple[int, int], new_id: int) -> list[int]:
     merged: list[int] = []
     i = 0

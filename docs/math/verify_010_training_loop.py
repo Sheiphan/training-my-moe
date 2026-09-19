@@ -444,9 +444,13 @@ for step in range(5):
     rB = _run_step(mB, optB, [(X, Y, None)], "cpu", step, 5, CONFIG)
 diff = (mA.final_norm.weight - mB.final_norm.weight).abs().max().item()
 print(f"  G=2 (same window x2) vs G=1 : max |Δ final_norm.weight| = {diff:.2e}")
-print(f"  G=2 summed expert counts    : {rA[5]}   (G=1: {rB[5]})")
+# journal 042: `_run_step` returns expert counts as an on-device tensor
+# rather than nested lists, so that reading them costs no host-device
+# synchronization on the ~90% of steps that never log. Convert to compare.
+countsA, countsB = rA[5].tolist(), rB[5].tolist()
+print(f"  G=2 summed expert counts    : {countsA}   (G=1: {countsB})")
 assert diff == 0.0
-assert rA[5] == [[c * 2 for c in layer] for layer in rB[5]]
+assert countsA == [[c * 2 for c in layer] for layer in countsB]
 
 # (b) G=2 over two DISTINCT windows reproduces a true batch-of-2 loss.
 stream2 = [4, 1, 4, 1, 4]
@@ -466,7 +470,11 @@ xb = torch.stack([w0[0], w1[0]])
 yb = torch.stack([w0[1], w1[1]])
 lg, _ = mD(xb, targets=yb)
 true_batch2 = F.cross_entropy(lg.reshape(-1, 6), yb.reshape(-1)).item()
-print(f"  micro-batch lm_losses       : {[round(x['lm_loss'], 6) for x in micro]}")
+# journal 042: `_forward_backward_core` hands back detached tensors so the
+# host-device sync happens once per optimizer step, inside
+# `_average_metrics`, rather than 2-5 times per micro-batch (two of them
+# before `backward()` was even enqueued).
+print(f"  micro-batch lm_losses       : {[round(float(x['lm_loss']), 6) for x in micro]}")
 print(f"  _average_metrics -> lm_loss : {avg['lm_loss']:.6f}")
 print(f"  true batch-of-2 lm_loss     : {true_batch2:.6f}")
 print(f"  max |avg - true batch-2|    : {abs(avg['lm_loss'] - true_batch2):.2e}")
@@ -547,8 +555,12 @@ print(f"  checkpoint keys            : {sorted(ckpt.keys())}")
 print(f"  saved step                 : {ckpt['step']}")
 print(f"  resume(3+2) vs uninterrupted(5): max |Δ final_norm.weight| = {resume_diff:.2e}")
 assert ckpt["step"] == 3
+# journal 041 added `total_steps` and `data_fingerprint` to the payload so
+# a resume can refuse settings that would silently re-align the data stream
+# and shift the LR schedule under a partly-trained checkpoint.
 assert set(ckpt.keys()) == {
-    "model_state_dict", "optimizer_state_dict", "model_config", "train_config", "step", "tokenizer_meta",
+    "model_state_dict", "optimizer_state_dict", "model_config", "train_config", "step",
+    "tokenizer_meta", "total_steps", "data_fingerprint",
 }
 assert resume_diff < 1e-6
 

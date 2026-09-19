@@ -127,8 +127,11 @@ class _FakeModel:
 
 
 fake_model = _FakeModel([_FakeBlock(layer0), _FakeBlock(layer1)])
-counts_per_layer = _collect_expert_counts(fake_model)
-print("\n=== _collect_expert_counts(model) (trainer.py:168-173) ===")
+# journal 042: returns a (n_layers, n_experts) tensor on the model's
+# device now -- the per-layer `.tolist()` it used to do was one
+# host-device sync per layer, per micro-batch, on every step.
+counts_per_layer = _collect_expert_counts(fake_model).tolist()
+print("\n=== _collect_expert_counts(model) (trainer.py:198-211) ===")
 print(counts_per_layer)
 assert counts_per_layer == [[3, 1, 2, 0], [2, 2, 1, 1]]
 

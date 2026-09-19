@@ -195,12 +195,20 @@ def _infinite_batches(loader: DataLoader):
         yield from loader
 
 
-def _collect_expert_counts(model: QwenMoEModel) -> list[list[int]]:
+def _collect_expert_counts(model: QwenMoEModel) -> torch.Tensor:
     """Per-layer, per-routed-expert dispatched-token counts from the most
     recent forward call (Requirement 8.2), read from the
     `MoELayer.last_expert_counts` cache each block's MoE layer populates.
+
+    Returns a `(n_layers, n_routed_experts)` tensor **on the model's
+    device**, deliberately not a list of lists (journal 042). This is
+    called after every micro-batch, and the previous `.tolist()` forced one
+    host-device synchronization *per layer* -- ten pipeline stalls per
+    micro-batch on `SCALE_300M`, on every step, even though the result is
+    discarded on the ~90% of steps that aren't logging steps. Converting is
+    now the caller's job, done once inside the logging branch.
     """
-    return [block.moe.last_expert_counts.tolist() for block in model.blocks]
+    return torch.stack([block.moe.last_expert_counts for block in model.blocks])
 
 
 def _forward_backward_core(
@@ -266,7 +274,7 @@ def _forward_backward_core(
     aux_loss = extras.get("aux_loss")
     total_loss = loss if aux_loss is None else loss + aux_loss
 
-    z_loss: float | None = None
+    z_loss: torch.Tensor | None = None
     if z_loss_weight > 0:
         # `logsumexp(logits)` is `log(sum_v exp(logit_v))` -- the log of the
         # softmax normalizer Z. Cross-entropy is invariant to adding a
@@ -278,20 +286,25 @@ def _forward_backward_core(
         log_z = torch.logsumexp(logits.reshape(-1, logits.size(-1)), dim=-1)
         z_loss_term = z_loss_weight * log_z.pow(2).mean()
         total_loss = total_loss + z_loss_term
-        z_loss = z_loss_term.item()
+        # journal 042: deliberately NOT `.item()` here. This line sits
+        # *before* `backward()` is enqueued, so reading the value drains the
+        # pipeline and leaves the accelerator idle while Python walks to the
+        # backward call -- strictly worse than a sync after it. The value is
+        # detached and converted by `_average_metrics`, on logging steps only.
+        z_loss = z_loss_term.detach()
 
-    mtp_loss: float | None = None
-    mtp_losses: list[float] | None = None
+    mtp_loss: torch.Tensor | None = None
+    mtp_losses: list[torch.Tensor] | None = None
     mtp_mean = extras.get("mtp_loss")
     if mtp_mean is not None:
         total_loss = total_loss + model.config.mtp_lambda * mtp_mean
-        mtp_loss = mtp_mean.item()
-        mtp_losses = [t.item() for t in extras["mtp_losses"]]
+        mtp_loss = mtp_mean.detach()
+        mtp_losses = [t.detach() for t in extras["mtp_losses"]]
 
     (total_loss * loss_scale).backward()
     return {
-        "lm_loss": loss.item(),
-        "aux_loss": aux_loss.item() if aux_loss is not None else None,
+        "lm_loss": loss.detach(),
+        "aux_loss": aux_loss.detach() if aux_loss is not None else None,
         "z_loss": z_loss,
         "mtp_loss": mtp_loss,
         "mtp_losses": mtp_losses,
@@ -326,7 +339,7 @@ def _forward_backward_step(
     # signal: a rising norm here typically precedes a loss spike.
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
     optimizer.step()
-    return metrics, float(grad_norm)
+    return _average_metrics([metrics]), float(grad_norm)
 
 
 def _average_metrics(metrics_list: list[dict]) -> dict:
@@ -341,15 +354,29 @@ def _average_metrics(metrics_list: list[dict]) -> dict:
     With a single-element `metrics_list` (`grad_accum_steps == 1`, the
     default) this is the identity on that one dict -- every existing
     single-micro-batch test's exact values are unaffected.
+
+    Since journal 042 `_forward_backward_core` returns **detached tensors**
+    rather than Python floats, so the averaging happens on-device and the
+    single host-device synchronization lands here -- once per *optimizer*
+    step, after every micro-batch's `backward()` has been enqueued, instead
+    of two-to-five times per micro-batch with two of them landing before
+    `backward()`. The returned dict still holds plain floats, so every
+    caller and every existing test is unchanged.
     """
+
+    def _to_float(value):
+        return float(value) if isinstance(value, torch.Tensor) else value
 
     def _mean(key: str) -> float | None:
         values = [m[key] for m in metrics_list if m[key] is not None]
-        return sum(values) / len(values) if values else None
+        return _to_float(sum(values) / len(values)) if values else None
 
     mtp_losses_lists = [m["mtp_losses"] for m in metrics_list if m["mtp_losses"] is not None]
     mtp_losses = (
-        [sum(depth_losses) / len(depth_losses) for depth_losses in zip(*mtp_losses_lists)]
+        [
+            _to_float(sum(depth_losses) / len(depth_losses))
+            for depth_losses in zip(*mtp_losses_lists)
+        ]
         if mtp_losses_lists
         else None
     )
@@ -363,14 +390,25 @@ def _average_metrics(metrics_list: list[dict]) -> dict:
     }
 
 
-def _sum_expert_counts(per_microbatch: list[list[list[int]]]) -> list[list[int]]:
+def _sum_expert_counts(
+    per_microbatch: list[torch.Tensor] | list[list[list[int]]],
+) -> torch.Tensor | list[list[int]]:
     """Elementwise-sums `_collect_expert_counts` readings taken after each
     micro-batch in an accumulation window, so the logged per-expert token
     counts reflect the *whole* effective batch rather than just the last
     micro-batch (`MoELayer.last_expert_counts` is overwritten by every
     forward call). With one micro-batch (`grad_accum_steps == 1`) this is
     the identity on that single reading.
+
+    Accepts either a list of `(n_layers, n_experts)` tensors (what
+    `_collect_expert_counts` produces since journal 042, summed on-device
+    with no synchronization) or the nested-list form, which the
+    `docs/math/verify_*.py` scripts pass directly. Output mirrors the input
+    kind.
     """
+    if isinstance(per_microbatch[0], torch.Tensor):
+        # The hot path since journal 042: stays on-device, no sync.
+        return torch.stack(per_microbatch).sum(dim=0)
     n_layers = len(per_microbatch[0])
     return [
         [sum(counts[layer_idx][expert_idx] for counts in per_microbatch)
@@ -463,7 +501,10 @@ def _run_step(
     optimizer.step()
     metrics = _average_metrics(step_metrics)
     expert_counts = _sum_expert_counts(expert_counts_per_microbatch)
-    return metrics, float(grad_norm), current_lr, device, model, expert_counts
+    # journal 042: `grad_norm` stays a tensor here. `float()` on it is a
+    # host-device sync, and the caller only needs the number on logging
+    # steps -- so the conversion moved there.
+    return metrics, grad_norm, current_lr, device, model, expert_counts
 
 
 def _evaluate(
@@ -1304,7 +1345,7 @@ class Trainer:
                             "mtp_loss": metrics["mtp_loss"],
                             "mtp_losses": metrics["mtp_losses"],
                             "lr": current_lr,
-                            "grad_norm": grad_norm,
+                            "grad_norm": float(grad_norm),
                             "elapsed_s": elapsed,
                             # journal 041: `elapsed_s` alone can't tell "the
                             # run was down for six hours" from "these steps
@@ -1328,7 +1369,11 @@ class Trainer:
                             # Summed across the accumulation window by
                             # `_run_step` (`_sum_expert_counts`), not just the
                             # last micro-batch's reading.
-                            "expert_token_counts": expert_counts,
+                            "expert_token_counts": (
+                                expert_counts.tolist()
+                                if isinstance(expert_counts, torch.Tensor)
+                                else expert_counts
+                            ),
                         },
                     )
 
