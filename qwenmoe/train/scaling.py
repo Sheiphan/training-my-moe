@@ -152,8 +152,22 @@ def _training_step(model: QwenMoEModel, x: torch.Tensor, y: torch.Tensor) -> Non
 
 
 def _synchronize(device: str) -> None:
+    """Blocks until queued accelerator work has finished.
+
+    Both MPS and CUDA dispatch kernels asynchronously, so a timing loop
+    that doesn't synchronize measures how fast Python can *enqueue* work,
+    not how fast the GPU does it -- on CUDA that reads as an implausibly
+    high tokens/sec and silently invalidates every number
+    `calibrate_throughput` reports (journal 042).
+
+    `startswith` rather than `==` so an explicit `"cuda:1"` from a caller
+    still synchronizes; `select_device` itself only ever returns the bare
+    `"cuda"`.
+    """
     if device == "mps":
         torch.mps.synchronize()
+    elif device.startswith("cuda"):
+        torch.cuda.synchronize()
 
 
 def calibrate_throughput(

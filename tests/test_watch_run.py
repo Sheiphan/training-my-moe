@@ -232,3 +232,58 @@ def test_expert_balance_ignores_layers_with_no_dispatched_tokens():
 
 def test_expert_balance_is_none_without_counts():
     assert expert_balance([]) is None
+
+
+# -- CUDA telemetry (journal 042) --------------------------------------------
+
+
+def _cuda_step(step, **overrides):
+    record = _step(step)
+    record.pop("mps_allocated_bytes")
+    record.pop("mps_driver_bytes")
+    record.update(
+        device="cuda",
+        device_allocated_bytes=34_000_000_000,
+        device_reserved_bytes=38_400_000_000,
+    )
+    record.update(overrides)
+    return record
+
+
+def test_cuda_memory_panel_uses_device_neutral_keys(tmp_path):
+    _write_log(tmp_path, [_run_start(device="cuda")] + [_cuda_step(i) for i in range(1, 11)])
+    report, alerts = _summarize(tmp_path)
+    assert "cuda 34.00GB" in report
+    assert "reserved 38.40GB" in report
+    assert alerts == []
+
+
+def test_mps_logs_written_before_the_cuda_port_still_render(tmp_path):
+    """The reason the `mps_*` keys were kept rather than renamed: every
+    run already on disk, and every journal figure quoting one, stays
+    readable."""
+    _write_log(tmp_path, [_run_start()] + [_step(i) for i in range(1, 11)])
+    report, _ = _summarize(tmp_path)
+    assert "mps 8.00GB" in report
+    assert "reserved 12.00GB" in report
+
+
+def test_device_oom_alerts(tmp_path):
+    """A CUDA OOM kills the run outright -- there is deliberately no cpu
+    fallback -- so the watcher has to say so loudly."""
+    _write_log(
+        tmp_path,
+        [_run_start(device="cuda")]
+        + [_cuda_step(i) for i in range(1, 11)]
+        + [{
+            "type": "device_oom",
+            "step": 10,
+            "wall_clock": time.time(),
+            "device": "cuda",
+            "device_allocated_bytes": 78_000_000_000,
+            "device_reserved_bytes": 79_500_000_000,
+        }],
+    )
+    _, alerts = _summarize(tmp_path)
+    assert any("CUDA OOM" in a for a in alerts)
+    assert any("latest.pt" in a for a in alerts)

@@ -151,7 +151,7 @@ def main() -> None:
     parser.add_argument("--max-eval-batches", type=int, default=50)
     parser.add_argument("--checkpoint-interval-steps", type=int, default=500)
     parser.add_argument("--log-interval-steps", type=int, default=10)
-    parser.add_argument("--device", choices=["auto", "mps", "cpu"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument(
@@ -210,6 +210,14 @@ def main() -> None:
     )
     schedule.add_argument("--muon-lr", type=float, default=None)
     schedule.add_argument("--muon-momentum", type=float, default=0.95)
+    schedule.add_argument(
+        "--no-tf32",
+        dest="tf32",
+        action="store_false",
+        help="disable TF32 tensor cores for fp32 matmuls on CUDA (journal 042). "
+        "On by default; turn it off only for a numerical-reproducibility run",
+    )
+    schedule.set_defaults(tf32=True)
 
     # -- long-run machinery (journal 041)
     longrun = parser.add_argument_group("long-run machinery")

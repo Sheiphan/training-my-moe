@@ -97,6 +97,7 @@ def summarize(run_dir: Path, *, stale_minutes: float, min_free_gb: float) -> tup
     checkpoints = [r for r in records if r.get("type") == "checkpoint"]
     starts = [r for r in records if r.get("type") == "run_start"]
     fallbacks = [r for r in records if r.get("type") == "device_fallback"]
+    ooms = [r for r in records if r.get("type") == "device_oom"]
     interrupts = [r for r in records if r.get("type") == "interrupt"]
     skipped = [r for r in records if r.get("type") == "checkpoint_skipped"]
 
@@ -173,11 +174,17 @@ def summarize(run_dir: Path, *, stale_minutes: float, min_free_gb: float) -> tup
     mem = []
     if last.get("rss_bytes"):
         mem.append(f"rss {last['rss_bytes'] / 1e9:.2f}GB")
-    if last.get("mps_allocated_bytes"):
-        mem.append(f"mps {last['mps_allocated_bytes'] / 1e9:.2f}GB")
-    if last.get("mps_driver_bytes"):
-        # the figure that actually predicts swapping on this machine
-        mem.append(f"driver {last['mps_driver_bytes'] / 1e9:.2f}GB")
+    # journal 042: prefer the device-neutral pair, fall back to the mps-only
+    # keys so logs written before the CUDA port still render.
+    label = (last.get("device") or "device").split(":")[0]
+    allocated = last.get("device_allocated_bytes") or last.get("mps_allocated_bytes")
+    reserved = last.get("device_reserved_bytes") or last.get("mps_driver_bytes")
+    if allocated:
+        mem.append(f"{label} {allocated / 1e9:.2f}GB")
+    if reserved:
+        # CUDA's memory_reserved / MPS's driver_allocated_memory: what the
+        # allocator holds, which is the figure that predicts an OOM
+        mem.append(f"reserved {reserved / 1e9:.2f}GB")
     if mem:
         lines.append("  memory " + "  ".join(mem))
 
@@ -204,6 +211,13 @@ def summarize(run_dir: Path, *, stale_minutes: float, min_free_gb: float) -> tup
                 f"no step logged for {_fmt_duration(stale_s)} (last was step {last['step']:,})"
             )
 
+    for oom in ooms:
+        alerts.append(
+            f"CUDA OOM at step {oom['step']:,} "
+            f"(allocated {(oom.get('device_allocated_bytes') or 0) / 1e9:.1f}GB, "
+            f"reserved {(oom.get('device_reserved_bytes') or 0) / 1e9:.1f}GB) -- "
+            "the run died; resume from checkpoints/latest.pt"
+        )
     for fallback in fallbacks:
         alerts.append(
             f"DEVICE FALLBACK at step {fallback['step']:,}: "

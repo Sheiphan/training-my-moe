@@ -7,6 +7,7 @@ import torch
 from qwenmoe.config import ModelConfig
 from qwenmoe.model.transformer import QwenMoEModel
 from qwenmoe.train.scaling import (
+    _synchronize,
     calibrate_throughput,
     chinchilla_budget,
     count_params,
@@ -172,3 +173,43 @@ def test_calibrate_throughput_rejects_invalid_n_steps():
 
     with pytest.raises(ValueError):
         calibrate_throughput(model, (x, y), device="cpu", n_steps=0)
+
+
+# -- _synchronize across backends (journal 042) ------------------------------
+
+
+def test_synchronize_calls_cuda_synchronize_on_cuda(monkeypatch):
+    """The bug this guards: `_synchronize` only handled mps, so on CUDA --
+    which dispatches kernels asynchronously -- `calibrate_throughput` timed
+    how fast Python could *enqueue* work, not how fast the GPU did it. That
+    reads as an implausibly high tok/s and silently invalidates every
+    throughput number measured on a rented GPU.
+    """
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: calls.append("cuda"))
+    _synchronize("cuda")
+    assert calls == ["cuda"]
+
+
+def test_synchronize_handles_an_indexed_cuda_device(monkeypatch):
+    """`select_device` returns a bare "cuda", but a caller may pass
+    "cuda:1" -- matching on equality would silently skip the sync."""
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: calls.append("cuda"))
+    _synchronize("cuda:1")
+    assert calls == ["cuda"]
+
+
+def test_synchronize_calls_mps_synchronize_on_mps(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.mps, "synchronize", lambda *a, **k: calls.append("mps"))
+    _synchronize("mps")
+    assert calls == ["mps"]
+
+
+def test_synchronize_is_a_noop_on_cpu(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: calls.append("cuda"))
+    monkeypatch.setattr(torch.mps, "synchronize", lambda *a, **k: calls.append("mps"))
+    _synchronize("cpu")
+    assert calls == []

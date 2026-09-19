@@ -53,23 +53,67 @@ def _read_jsonl(path):
 # -- select_device (Requirement 3.2) -----------------------------------------
 
 
+def _fake_backends(monkeypatch, *, cuda: bool, mps: bool):
+    """Both probes must be patched (journal 042). Patching only the mps one
+    made these tests pass on a Mac and fail on a CUDA box, because
+    `select_device` now checks cuda first."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps)
+
+
 def test_select_device_explicit_cpu_always_returns_cpu(monkeypatch):
-    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    _fake_backends(monkeypatch, cuda=True, mps=True)
     assert select_device("cpu") == "cpu"
 
 
 def test_select_device_prefers_mps_when_available(monkeypatch):
-    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    _fake_backends(monkeypatch, cuda=False, mps=True)
     assert select_device("auto") == "mps"
     assert select_device("mps") == "mps"
 
 
 def test_select_device_falls_back_to_cpu_when_mps_unavailable(monkeypatch, caplog):
-    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    _fake_backends(monkeypatch, cuda=False, mps=False)
     assert select_device("auto") == "cpu"
     with caplog.at_level("WARNING"):
         assert select_device("mps") == "cpu"
     assert "mps" in caplog.text.lower()
+
+
+# -- select_device on CUDA (journal 042) -------------------------------------
+
+
+def test_select_device_prefers_cuda_over_mps(monkeypatch):
+    """An H100 box may also report mps available under emulation; cuda wins."""
+    _fake_backends(monkeypatch, cuda=True, mps=True)
+    assert select_device("auto") == "cuda"
+    assert select_device("cuda") == "cuda"
+
+
+def test_select_device_returns_bare_cuda_not_indexed(monkeypatch):
+    """`torch.autocast(device_type=...)` rejects "cuda:0", and passing the
+    trainer's device string straight through is why bf16 needed no separate
+    CUDA plumbing."""
+    _fake_backends(monkeypatch, cuda=True, mps=False)
+    assert select_device("auto") == "cuda"
+
+
+def test_select_device_explicit_mps_does_not_take_cuda(monkeypatch):
+    _fake_backends(monkeypatch, cuda=True, mps=True)
+    assert select_device("mps") == "mps"
+
+
+def test_select_device_explicit_cuda_when_unavailable_warns(monkeypatch, caplog):
+    _fake_backends(monkeypatch, cuda=False, mps=False)
+    with caplog.at_level("WARNING"):
+        assert select_device("cuda") == "cpu"
+    assert "cuda" in caplog.text.lower()
+
+
+def test_select_device_explicit_cuda_does_not_silently_take_mps(monkeypatch):
+    """Falling back cuda->mps would be a surprise; cpu is the honest answer."""
+    _fake_backends(monkeypatch, cuda=False, mps=True)
+    assert select_device("cuda") == "cpu"
 
 
 # -- lr_multiplier (Requirement 5.1: warmup + cosine decay) ------------------

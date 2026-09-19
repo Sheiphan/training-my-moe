@@ -7,7 +7,7 @@ Nothing here wraps a model library. Every component (RMSNorm, RoPE/ALiBi/NoPE, G
 SwiGLU/GEGLU/GELU experts, the MoE router and its load balancers, the training loop, the tokenizers, the
 sampling code) is implemented in `qwenmoe/` and covered by tests.
 
-The other half of the project is **explaining** it: a 41-entry engineering journal, an 9-notebook runnable
+The other half of the project is **explaining** it: a 42-entry engineering journal, an 9-notebook runnable
 tour, and three interactive pages that open straight from disk with no server and no build step.
 
 > **One convention runs through everything: no fabricated numbers.** Every figure in the journal, the
@@ -23,7 +23,7 @@ Requires Python ≥ 3.12 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                                  # install
-uv run pytest -q                         # 492 tests
+uv run pytest -q                         # 522 tests
 
 # prepare data, train the fast smoke config, generate from it
 uv run python scripts/prepare_data.py --corpus tiny_shakespeare --tokenizer-type char
@@ -71,8 +71,8 @@ configs/presets.py  named ModelConfigs (see below)
 scripts/            prepare_data, train, generate, run_comparison,
                     run_ablation_study, export_trace, render_viz
 notebooks/          runnable code tour, 00 is the map
-journey_of_a_model/ 41 engineering-journal entries + figures
-tests/              492 tests
+journey_of_a_model/ 42 engineering-journal entries + figures
+tests/              522 tests
 ```
 
 ## Presets

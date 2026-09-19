@@ -70,18 +70,27 @@ class TrainResult:
     checkpoint_path: Path | None
 
 
-def select_device(requested: Literal["auto", "mps", "cpu"]) -> str:
-    """Requirement 3.2: `mps` if available, else `cpu`; `requested="cpu"`
-    always forces `cpu`. Warns (doesn't raise) if `mps` was explicitly
-    requested but isn't available (design.md Error Handling: MPS
-    unavailable falls back rather than crashing).
+def select_device(requested: Literal["auto", "cuda", "mps", "cpu"]) -> str:
+    """Requirement 3.2, extended to CUDA in journal 042: `cuda` if
+    available, else `mps`, else `cpu`; `requested="cpu"` always forces
+    `cpu`. Warns (doesn't raise) if an accelerator was explicitly requested
+    but isn't available (design.md Error Handling: a missing backend falls
+    back rather than crashing).
+
+    Returns the **bare** string `"cuda"`, never `"cuda:0"`. That is not
+    cosmetic: `torch.autocast(device_type=device)` in
+    `_forward_backward_core` requires the bare form, and passing the
+    trainer's own device string straight through is the whole reason bf16
+    needed no separate CUDA plumbing.
     """
     if requested == "cpu":
         return "cpu"
-    if torch.backends.mps.is_available():
+    if requested != "mps" and torch.cuda.is_available():
+        return "cuda"
+    if requested != "cuda" and torch.backends.mps.is_available():
         return "mps"
-    if requested == "mps":
-        logger.warning("device='mps' requested but unavailable; falling back to cpu")
+    if requested in ("cuda", "mps"):
+        logger.warning("device=%r requested but unavailable; falling back to cpu", requested)
     return "cpu"
 
 
@@ -552,6 +561,49 @@ def _mps_driver_bytes() -> int | None:
     return None
 
 
+def _device_memory_bytes(device: str) -> tuple[int | None, int | None]:
+    """`(allocated, reserved)` for whichever accelerator is in use
+    (journal 042).
+
+    The second figure is the one that matters, and the parallel between
+    the backends is exact: CUDA's `memory_reserved` is what the caching
+    allocator holds from the driver, just as MPS's `driver_allocated_memory`
+    is. Journal 041 found the hard way that watching only *allocated* is
+    how a run looks like a clean fit right up until it starts swapping --
+    on MPS that was a 9.5 -> 20.5GB climb the allocated figure never
+    showed. Reserved is the number that predicts an OOM.
+
+    `(None, None)` on cpu, and on any backend whose probe raises.
+    """
+    if device.startswith("cuda"):
+        with contextlib.suppress(Exception):
+            return int(torch.cuda.memory_allocated()), int(torch.cuda.memory_reserved())
+        return None, None
+    if device == "mps":
+        return _mps_allocated_bytes(), _mps_driver_bytes()
+    return None, None
+
+
+def _cuda_hardware() -> dict:
+    """Identifies the GPU a run actually executed on, so a journal entry
+    can cite hardware rather than assert it. Empty off CUDA."""
+    if not torch.cuda.is_available():
+        return {}
+    info: dict = {}
+    with contextlib.suppress(Exception):
+        info["cuda_device_name"] = torch.cuda.get_device_name()
+        info["cuda_capability"] = ".".join(str(v) for v in torch.cuda.get_device_capability())
+        info["cuda_total_memory_bytes"] = int(
+            torch.cuda.get_device_properties(0).total_memory
+        )
+        info["cuda_version"] = torch.version.cuda
+        # Whether SDPA is allowed to pick the flash backend -- the
+        # difference between a fast and a very slow attention.
+        info["flash_sdp_enabled"] = bool(torch.backends.cuda.flash_sdp_enabled())
+        info["tf32_matmul"] = torch.get_float32_matmul_precision()
+    return info
+
+
 def _git_sha() -> str | None:
     """The commit the run started from, so a log can be tied back to the
     code that produced it. Best-effort: a run from a tarball is still a
@@ -599,6 +651,7 @@ def _run_start_record(
         "precision": config.precision,
         "torch_version": torch.__version__,
         "git_sha": _git_sha(),
+        **_cuda_hardware(),  # journal 042: cite the GPU, don't assert it
         "start_step": start_step,
         "total_steps": total_steps,
         "tokens_per_step": tokens_per_step,
@@ -974,6 +1027,13 @@ class Trainer:
         device = select_device(config.device)
         torch.manual_seed(config.seed)
 
+        if device.startswith("cuda") and config.tf32:
+            # journal 042: lets cuBLAS use tensor cores for the fp32
+            # matmuls that bf16 autocast leaves alone. Small under bf16,
+            # decisive under --precision fp32 (~50 vs ~400 TFLOP/s on an
+            # H100). No effect on mps/cpu, so the laptop path is unchanged.
+            torch.set_float32_matmul_precision("high")
+
         # Requirement 3.2 / design.md Error Handling: state the effective
         # precision up front. bf16 means the forward pass runs under
         # `torch.autocast`; if the backend can't, `_run_step` catches the
@@ -987,6 +1047,16 @@ class Trainer:
             device,
             config.z_loss_weight,
         )
+        if device.startswith("cuda"):
+            hardware = _cuda_hardware()
+            logger.info(
+                "cuda: %s (sm_%s, %.1fGB) | flash sdp %s | tf32 matmul %r",
+                hardware.get("cuda_device_name", "?"),
+                hardware.get("cuda_capability", "?").replace(".", ""),
+                hardware.get("cuda_total_memory_bytes", 0) / 1e9,
+                "on" if hardware.get("flash_sdp_enabled") else "OFF",
+                hardware.get("tf32_matmul"),
+            )
 
         model = model.to(device)
         optimizer = build_optimizer(model, config)
@@ -1123,15 +1193,46 @@ class Trainer:
 
                 step_start = time.perf_counter()
                 device_before = device
-                metrics, grad_norm, current_lr, device, model, expert_counts = _run_step(
-                    model,
-                    optimizer,
-                    micro_batches,
-                    device,
-                    global_step,
-                    total_steps,
-                    config,
-                )
+                try:
+                    metrics, grad_norm, current_lr, device, model, expert_counts = _run_step(
+                        model,
+                        optimizer,
+                        micro_batches,
+                        device,
+                        global_step,
+                        total_steps,
+                        config,
+                    )
+                except torch.OutOfMemoryError:
+                    # journal 042: CUDA deliberately has no cpu fallback --
+                    # journal 041's lesson is that silently continuing at a
+                    # fraction of speed is the worst unattended failure
+                    # mode, and on CUDA that fraction is ~1/1000. So record
+                    # what the allocator held at the moment it died, then
+                    # re-raise. The retry loop resumes from latest.pt.
+                    oom_allocated, oom_reserved = _device_memory_bytes(device)
+                    _write_log_line(
+                        log_file,
+                        {
+                            "type": "device_oom",
+                            "step": global_step,
+                            "wall_clock": time.time(),
+                            "device": device,
+                            "device_allocated_bytes": oom_allocated,
+                            "device_reserved_bytes": oom_reserved,
+                            "batch_size": config.batch_size,
+                            "seq_len": config.seq_len,
+                        },
+                    )
+                    logger.error(
+                        "CUDA OOM at step %d (allocated %.2fGB, reserved %.2fGB). "
+                        "Resume from checkpoints/latest.pt, or lower --batch-size "
+                        "(note that changes the data fingerprint).",
+                        global_step,
+                        (oom_allocated or 0) / 1e9,
+                        (oom_reserved or 0) / 1e9,
+                    )
+                    raise
                 if device != device_before:
                     # `_run_step` drops to cpu on an mps RuntimeError and
                     # logs a warning. On an unattended multi-day run that
@@ -1177,6 +1278,7 @@ class Trainer:
                     # blip) shouldn't move the ETA by hours.
                     median_elapsed = statistics.median(recent_elapsed)
                     tokens_per_sec = tokens_per_step / elapsed if elapsed > 0 else None
+                    device_allocated, device_reserved = _device_memory_bytes(device)
                     logger.info(
                         "step %d/%d | loss %.4f | aux_loss %s | z_loss %s | mtp_loss %s "
                         "| lr %.2e | elapsed %.3fs | %s tok/s | eta %s",
@@ -1213,8 +1315,14 @@ class Trainer:
                             "tokens_per_sec": tokens_per_sec,
                             "eta_s": (total_steps - global_step) * median_elapsed,
                             "rss_bytes": _rss_bytes(),
+                            # journal 042: the `mps_*` keys stay so every
+                            # log already on disk -- and every journal
+                            # figure quoting one -- keeps its meaning. The
+                            # device-neutral pair is what new readers use.
                             "mps_allocated_bytes": _mps_allocated_bytes(),
                             "mps_driver_bytes": _mps_driver_bytes(),
+                            "device_allocated_bytes": device_allocated,
+                            "device_reserved_bytes": device_reserved,
                             "device": device,  # changes if the cpu fallback fires
                             "epoch": tokens_seen / unique_train_tokens,
                             # Summed across the accumulation window by

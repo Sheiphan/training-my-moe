@@ -111,8 +111,13 @@ class TrainConfig:
     eval_interval_steps: int = 100
     max_eval_batches: int = 50          # cap so validation stays fast on a large val split
     log_interval_steps: int = 10       # console/JSON-lines logging cadence (Requirement 5.2)
-    device: Literal["auto", "mps", "cpu"] = "auto"
+    device: Literal["auto", "cuda", "mps", "cpu"] = "auto"
     seed: int = 1337
+    # journal 042: TF32 for the fp32 matmuls CUDA leaves outside bf16
+    # autocast. Ignored on mps/cpu. Off would mean true fp32 on an H100 --
+    # ~50 TFLOP/s instead of ~400 -- so it defaults on and exists mainly so
+    # a numerical-reproducibility run can turn it off.
+    tf32: bool = True
 
     # -- moe-modernization spec --
     # Optimizer (Requirement 1). betas/weight_decay defaults are a

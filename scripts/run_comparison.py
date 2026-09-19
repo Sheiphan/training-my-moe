@@ -101,7 +101,7 @@ def main() -> None:
     parser.add_argument("--max-eval-batches", type=int, default=50)
     parser.add_argument("--checkpoint-interval-steps", type=int, default=500)
     parser.add_argument("--log-interval-steps", type=int, default=10)
-    parser.add_argument("--device", choices=["auto", "mps", "cpu"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
         "--seeds",
