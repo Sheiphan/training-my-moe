@@ -103,8 +103,13 @@ def test_detect_hardware_returns_a_known_device_and_positive_budget():
 
 
 def test_recommend_max_total_params_grows_with_budget():
-    small = HardwareInfo(device="cpu", total_system_memory=None, safe_budget_bytes=10 * 1024**3)
-    large = HardwareInfo(device="cpu", total_system_memory=None, safe_budget_bytes=40 * 1024**3)
+    # Budgets raised from 10/40GB in journal 044: the activation estimate now
+    # carries a measured 2.2x backward factor, so at batch 16 / seq 256 with
+    # the 768x10 shape hint the activations alone are ~11.5GB. A 10GB budget
+    # legitimately leaves room for zero parameters now, which is the
+    # estimator being right rather than the test being wrong.
+    small = HardwareInfo(device="cpu", total_system_memory=None, safe_budget_bytes=40 * 1024**3)
+    large = HardwareInfo(device="cpu", total_system_memory=None, safe_budget_bytes=80 * 1024**3)
     small_target = recommend_max_total_params(small, batch_size=16, seq_len=256)
     large_target = recommend_max_total_params(large, batch_size=16, seq_len=256)
     assert 0 < small_target < large_target
@@ -166,3 +171,70 @@ def test_verify_empirically_returns_positive_bytes_on_cpu(overrides):
     )
     peak_bytes = verify_empirically(config, batch_size=2, seq_len=8, device="cpu")
     assert peak_bytes > 0
+
+
+# -- recalibrated against real H100 measurements (journal 044) ---------------
+
+# (batch, seq, measured peak GB on an H100 with SCALE_300M @ vocab 4097,
+#  or None where the configuration actually OOMed)
+_H100_MEASUREMENTS = [
+    (8, 1024, 33.26),
+    (16, 1024, 64.88),
+    (24, 1024, None),
+    (32, 512, 58.27),
+    (48, 512, None),
+    (64, 256, 51.09),
+]
+_H100_FREE_BYTES = 84.47e9
+
+
+def _scale_300m_estimate_gb(batch_size: int, seq_len: int) -> float:
+    import dataclasses
+
+    import configs.presets as presets
+
+    config = dataclasses.replace(presets.SCALE_300M, vocab_size=4097)
+    activation = estimate_activation_bytes(
+        batch_size, seq_len, config.n_layers, config.d_model, config.n_heads, config.vocab_size
+    )
+    static = 337_458_944 * 16  # fp32 weights + grads + two AdamW moments
+    return (activation + static) / 1e9
+
+
+@pytest.mark.parametrize("batch_size,seq_len,measured", _H100_MEASUREMENTS)
+def test_estimate_is_within_tolerance_of_real_h100_peaks(batch_size, seq_len, measured):
+    """Before journal 044 this estimator was ~50% under on CUDA and returned
+    FITS for two configurations that then OOMed."""
+    if measured is None:
+        pytest.skip("this configuration OOMed; covered by the verdict test")
+    estimate = _scale_300m_estimate_gb(batch_size, seq_len)
+    error = abs(estimate - measured) / measured
+    assert error < 0.15, f"estimate {estimate:.2f}GB vs measured {measured:.2f}GB ({error:.1%})"
+
+
+@pytest.mark.parametrize("batch_size,seq_len,measured", _H100_MEASUREMENTS)
+def test_verdict_matches_what_the_h100_actually_did(batch_size, seq_len, measured):
+    """A FITS verdict that OOMs is worse than no estimator at all, because
+    journal 037 established this failure mode is a hang, not a clean error."""
+    from scripts.check_capacity import _CUDA_USABLE_FRACTION
+
+    budget_gb = _H100_FREE_BYTES * _CUDA_USABLE_FRACTION / 1e9
+    fits = _scale_300m_estimate_gb(batch_size, seq_len) < budget_gb
+    assert fits is (measured is not None)
+
+
+def test_estimate_accounts_for_vocabulary():
+    """Logits are tokens x vocab and exist several times over; omitting them
+    was invisible at vocab 4097 and several GB at 16384."""
+    args = (16, 1024, 10, 768, 12)
+    small = estimate_activation_bytes(*args, 4097)
+    large = estimate_activation_bytes(*args, 16384)
+    assert large > small
+    # the delta is the extra logit copies, within rounding
+    expected = 16 * 1024 * (16384 - 4097) * 4 * 3
+    assert abs((large - small) - expected) < 1e6
+
+
+def test_estimate_without_vocab_still_works():
+    """The pre-044 signature has callers; it must not break."""
+    assert estimate_activation_bytes(8, 128, 4, 256, 8) > 0

@@ -56,6 +56,35 @@ BYTES_PER_PARAM_INFERENCE_FP32 = 4
 # gives the real one.
 _ACTIVATION_BYTES_PER_TOKEN_LAYER_DMODEL = 150
 
+# journal 044: the constant above was calibrated against MPS measurements in
+# journal 037. Measured against `--verify` on an H100 it under-reports by a
+# consistent factor, across four configurations that span batch 8-64 and
+# seq 256-1024:
+#
+#   B=8  S=1024   est 13.41GB activation   real 27.86GB   2.08x
+#   B=16 S=1024   est 26.88GB              real 59.48GB   2.21x
+#   B=32 S=512    est 22.85GB              real 52.87GB   2.31x
+#   B=64 S=256    est 20.84GB              real 45.69GB   2.19x
+#
+# The consistency says this is a missing factor rather than noise -- most
+# likely activations that forward saves and backward also holds. Until the
+# heuristic models that directly, a measured correction is more honest than
+# a verdict that says FITS and then OOMs (which it did, at B=24 S=1024 and
+# B=48 S=512).
+_ACTIVATION_BACKWARD_FACTOR = 2.2
+
+# Logits are `tokens x vocab_size` and exist several times over: the bf16
+# forward output, `logits.float()`'s fp32 copy, and what cross-entropy saves
+# for backward. Omitted entirely before journal 044 -- negligible at
+# vocab 4097 (0.8GB at 16k tokens) and emphatically not at vocab 16384.
+_LOGIT_COPIES = 3
+
+# journal 044: CUDA's `mem_get_info` free figure is every byte on the card,
+# and planning against all of it does not work -- the caching allocator
+# fragments, and B=48/S=512 OOMed on an H100 at an estimated 97% of "free".
+# Reserving a tenth made all six measured configurations classify correctly.
+_CUDA_USABLE_FRACTION = 0.90
+
 
 def total_system_memory_bytes() -> int | None:
     """Best-effort total physical RAM in bytes -- no new dependency."""
@@ -93,14 +122,19 @@ def detect_hardware() -> HardwareInfo:
     """Picks a device (cuda > mps > cpu -- informational only, this
     project's own `TrainConfig.device` doesn't support cuda yet) and a
     "safe budget": the framework's own reported ceiling where one exists
-    (CUDA's currently-free memory, Metal's `recommended_max_memory`),
+    (CUDA's currently-free memory less a fragmentation reserve, Metal's
+    `recommended_max_memory`),
     else 70% of total system RAM (CPU-only fallback, leaving headroom for
     the OS and everything else running).
     """
     total = total_system_memory_bytes()
     if torch.cuda.is_available():
         free_bytes, _total_bytes = torch.cuda.mem_get_info()
-        return HardwareInfo(device="cuda", total_system_memory=total, safe_budget_bytes=free_bytes)
+        return HardwareInfo(
+            device="cuda",
+            total_system_memory=total,
+            safe_budget_bytes=int(free_bytes * _CUDA_USABLE_FRACTION),
+        )
     if torch.backends.mps.is_available():
         return HardwareInfo(
             device="mps", total_system_memory=total, safe_budget_bytes=int(torch.mps.recommended_max_memory())
@@ -109,14 +143,30 @@ def detect_hardware() -> HardwareInfo:
     return HardwareInfo(device="cpu", total_system_memory=total, safe_budget_bytes=safe_budget)
 
 
-def estimate_activation_bytes(batch_size: int, seq_len: int, n_layers: int, d_model: int, n_heads: int) -> int:
+def estimate_activation_bytes(
+    batch_size: int,
+    seq_len: int,
+    n_layers: int,
+    d_model: int,
+    n_heads: int,
+    vocab_size: int | None = None,
+) -> int:
     """Rough heuristic (see module docstring) -- a linear per-token term
     plus the one piece with a real closed form: one attention score
-    matrix (`batch * n_heads * seq_len^2`, fp32) per layer."""
+    matrix (`batch * n_heads * seq_len^2`, fp32) per layer, all scaled by
+    `_ACTIVATION_BACKWARD_FACTOR`, plus a logits term when `vocab_size` is
+    known (journal 044).
+
+    `vocab_size` is optional so the pre-044 call signature keeps working,
+    but callers that have a config should pass it: at vocab 16384 the
+    logits are several GB and dropping them is how you get a confident
+    FITS on a configuration that OOMs.
+    """
     tokens = batch_size * seq_len
     linear_term = tokens * n_layers * d_model * _ACTIVATION_BYTES_PER_TOKEN_LAYER_DMODEL
     attn_term = batch_size * n_heads * seq_len * seq_len * n_layers * 4
-    return linear_term + attn_term
+    logit_term = tokens * vocab_size * 4 * _LOGIT_COPIES if vocab_size else 0
+    return int((linear_term + attn_term) * _ACTIVATION_BACKWARD_FACTOR) + logit_term
 
 
 def estimate_params(config: ModelConfig) -> tuple[int, int]:
@@ -210,10 +260,14 @@ def analyze(config: ModelConfig, batch_size: int, seq_len: int, hardware: Hardwa
     hardware = hardware or detect_hardware()
 
     static_bytes = total_params * BYTES_PER_PARAM_TRAIN_FP32
-    activation_bytes = estimate_activation_bytes(batch_size, seq_len, config.n_layers, config.d_model, config.n_heads)
+    activation_bytes = estimate_activation_bytes(
+        batch_size, seq_len, config.n_layers, config.d_model, config.n_heads, config.vocab_size
+    )
     # inference (no cache): forward-only, no retained backward graph or
     # optimizer state -- a rough discount off the training activation term.
-    inference_activation = estimate_activation_bytes(1, seq_len, config.n_layers, config.d_model, config.n_heads) // 3
+    inference_activation = estimate_activation_bytes(
+        1, seq_len, config.n_layers, config.d_model, config.n_heads, config.vocab_size
+    ) // 3
     inference_bytes = total_params * BYTES_PER_PARAM_INFERENCE_FP32 + inference_activation
     inference_kv_bytes = total_params * BYTES_PER_PARAM_INFERENCE_FP32 + kv_cache_bytes(
         config, batch_size=1, seq_len=seq_len
