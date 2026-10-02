@@ -150,7 +150,7 @@ def test_forward_with_trace_rejects_batch_size_greater_than_one():
 
 
 def test_forward_with_trace_populates_every_field_for_mla():
-    """MLAAttention.forward_with_trace (added alongside token_journey's
+    """MLAAttention.forward_with_trace (added alongside site/token-journey's
     per-variant deep-dive support): q/k are the FULL concat(content, rope)
     tensors actually used in the dot product, shaped
     (n_heads, seq_len, head_dim + rope_head_dim) -- not GQA's

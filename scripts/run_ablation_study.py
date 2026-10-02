@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Runs a real, compute-matched ablation study across the model's main
-architectural axes and exports the results for `ablation_study/`'s web
+architectural axes and exports the results for `site/ablation/`'s web
 page -- same "never fabricate a number" convention as
 `scripts/export_trace.py`.
 
@@ -12,7 +12,7 @@ rather than `ModelConfig` (`OPT_MUON` -> `optimizer="muon"`, `SCHED_WSD` ->
 `lr_schedule="wsd"`) are passed as `run_comparison`'s per-variant
 `train_overrides` (moe-modernization Requirement 12.5). `ATTN_MLA` and
 `TIE_FALSE` are ad-hoc overrides covering two axes the architecture toggle
-bar (token_journey/architecture.html) exposes; `mla_latent_dim=16` matches the
+bar (site/token-journey/architecture.html) exposes; `mla_latent_dim=16` matches the
 value it illustrates for SMOKE_TEST (`latentDim = headDim = 16`).
 
 The default corpus is TinyStories with the from-scratch BPE tokenizer
@@ -94,7 +94,7 @@ VARIANTS: dict[str, tuple[str, str, ModelConfig, dict]] = {
 }
 
 
-# Per-axis framing for `ablation_study/`'s explainer cards: what question
+# Per-axis framing for `site/ablation/`'s explainer cards: what question
 # the axis asks, and where the idea comes from. Prose only -- every NUMBER
 # the page shows still comes from a real `train.jsonl` below. `paper` is the
 # arXiv id of the work the option is taken from.
@@ -390,7 +390,7 @@ def main() -> None:
     parser.add_argument(
         "--finalize-only",
         action="store_true",
-        help="skip (re-)training; rebuild ablation_study/data/ablation.js from each "
+        help="skip (re-)training; rebuild site/ablation/data/ablation.js from each "
         "variant's already-written runs/ablation_study/<name>/logs/train.jsonl",
     )
     parser.add_argument(
@@ -497,7 +497,7 @@ def main() -> None:
         "loss_free_demo": _bias_mechanism_demo(),
     }
 
-    out_path = Path("ablation_study/data/ablation.js")
+    out_path = Path("site/ablation/data/ablation.js")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(f"window.ABLATION_DATA = {json.dumps(data)};\n")
 

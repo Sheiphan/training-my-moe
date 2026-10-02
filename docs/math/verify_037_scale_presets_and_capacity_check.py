@@ -32,6 +32,16 @@ from qwenmoe.model.kv_cache import LatentKVCache, LayerKVCache, build_kv_cache
 from qwenmoe.model.transformer import QwenMoEModel
 from qwenmoe.train.scaling import count_params
 
+import scripts.check_capacity as _cc  # noqa: E402
+
+# Doc 037 Parts 1-9 derive the heuristic as it stood BEFORE journal 044's
+# recalibration (x2.2 backward factor, plus a 3-copy logits term). Pin those two
+# knobs to their pre-044 values so every number in Parts 1-9 stays reproducible;
+# the Addendum at the end of this script restores the real constants and checks
+# what 044 changed.
+_REAL_FACTOR, _REAL_LOGIT_COPIES = _cc._ACTIVATION_BACKWARD_FACTOR, _cc._LOGIT_COPIES
+_cc._ACTIVATION_BACKWARD_FACTOR, _cc._LOGIT_COPIES = 1.0, 0
+
 PASS = "PASS"
 
 
@@ -220,6 +230,39 @@ print(
 )
 check("tiny-budget report already fails at 1x", tight_report.fits(tight_report.train_total_bytes), False)
 check("tiny-budget report fails at the 1.2x guard margin too", tight_report.fits(guard_margin), False)
+
+print("\n" + "=" * 70)
+print("Addendum (Part 10) -- what journal 044's recalibration changed")
+print("=" * 70)
+
+# Restore the REAL constants (the pin above was only to keep Parts 1-9 reproducible).
+_cc._ACTIVATION_BACKWARD_FACTOR, _cc._LOGIT_COPIES = _REAL_FACTOR, _REAL_LOGIT_COPIES
+check("real backward factor", _cc._ACTIVATION_BACKWARD_FACTOR, 2.2)
+check("real logit copies", _cc._LOGIT_COPIES, 3)
+check("real CUDA usable fraction", _cc._CUDA_USABLE_FRACTION, 0.90)
+
+# (a) the x2.2 factor, on TOY: Part 4's 7488 becomes int(7488 * 2.2).
+act_new_no_vocab = estimate_activation_bytes(BATCH, SEQ, TOY.n_layers, TOY.d_model, TOY.n_heads)
+print(f"estimate_activation_bytes(no vocab_size)   = {act_new_no_vocab}   (7488 * 2.2 = {7488 * 2.2})")
+check("x2.2 on the pre-044 activation estimate", act_new_no_vocab, int(7488 * 2.2))
+
+# (b) the logits term: tokens * vocab * 4 bytes * 3 copies, added AFTER the factor.
+tokens = BATCH * SEQ
+logit_term = tokens * TOY.vocab_size * 4 * 3
+act_new_with_vocab = estimate_activation_bytes(BATCH, SEQ, TOY.n_layers, TOY.d_model, TOY.n_heads, TOY.vocab_size)
+print(f"logit term = {tokens} * {TOY.vocab_size} * 4 * 3 = {logit_term}")
+print(f"estimate_activation_bytes(vocab_size={TOY.vocab_size}) = {act_new_with_vocab}")
+check("logit term (hand)", logit_term, 504)
+check("activation with logits = factor term + logit term", act_new_with_vocab, act_new_no_vocab + logit_term)
+check("activation with logits (hand)", act_new_with_vocab, 16977)
+
+# (c) where 2.2 comes from: the four H100 est-vs-real pairs quoted in the comment above
+# `_ACTIVATION_BACKWARD_FACTOR` in check_capacity.py (QUOTED from journal 044, not re-measured here).
+pairs = [(13.41, 27.86), (26.88, 59.48), (22.85, 52.87), (20.84, 45.69)]
+ratios = [real / est for est, real in pairs]
+mean_ratio = sum(ratios) / len(ratios)
+print("measured/estimated ratios:", [round(r, 3) for r in ratios], f"mean = {mean_ratio:.4f}")
+check("mean measured ratio rounds to the 2.2 factor", round(mean_ratio, 1), 2.2)
 
 print("\n" + "=" * 70)
 print("ALL CHECKS PASSED")

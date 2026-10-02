@@ -11,7 +11,7 @@ pass:
 
     attn_logit_std    = layer.attn_scores_pre_mask.std()       (export_trace.py:221)
     attn_logit_absmax = layer.attn_scores_pre_mask.abs().max()  (export_trace.py:222)
-    spread(values)    = max(values) - min(values)              (ablation_study/js/deep-dive.js:86-88)
+    spread(values)    = max(values) - min(values)              (site/ablation/js/deep-dive.js:86-88)
 
 applied per `TransformerBlock` layer and then, as "range across depth",
 across a whole model's layer list. This file:
@@ -47,7 +47,7 @@ def _section(title: str) -> None:
 
 
 def spread(values: list[float]) -> float:
-    """`ablation_study/js/deep-dive.js:86-88`, ported to Python verbatim."""
+    """`site/ablation/js/deep-dive.js:86-88`, ported to Python verbatim."""
     return max(values) - min(values)
 
 

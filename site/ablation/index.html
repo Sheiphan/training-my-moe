@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QwenMoE — Ablation Study</title>
+<link rel="stylesheet" href="../shared/lib/katex.min.css">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <p class="eyebrow"><a href="../index.html">All pages</a> · <a href="../token-journey/index.html">Token journey</a> · Real training runs · nothing illustrative</p>
+    <h1>What each architectural choice actually costs</h1>
+    <p class="lede">
+      Every row on this page is a real training run. Each one changes exactly one thing, trains on the
+      identical fixed token slice for the identical step budget, and reports what that single change did to
+      validation loss, throughput and expert routing. Every number is read from a real
+      <code>train.jsonl</code> written by <code>Trainer.fit</code> — none of it is illustrative.
+    </p>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="tiers" role="tablist">
+    <button class="tier-tab" role="tab" data-tier="axes" aria-selected="true">
+      Single-axis ablations
+      <small>14 runs · one variable at a time · <code>SMOKE_TEST</code> base</small>
+    </button>
+    <button class="tier-tab" role="tab" data-tier="presets" aria-selected="false">
+      The modernized presets
+      <small>3 runs × 2 seeds · <code>BASELINE</code> vs <code>BASELINE_V2</code> vs <code>FINEGRAINED</code></small>
+    </button>
+  </div>
+
+  <!-- =============== TIER 1: single-axis ablations =============== -->
+  <section id="tier-axes">
+    <p class="provenance" id="axisProvenance"></p>
+
+    <div class="picker" id="picker"></div>
+
+    <div class="explainer" id="explainer"></div>
+
+    <div class="verdict" id="verdict"></div>
+
+    <section class="panel">
+      <h2>Every axis at once</h2>
+      <p class="panel-sub">
+        The whole study in one view — sort by any column, click a row to load it above. The bar is the
+        validation-loss delta against the control, green to the left (better), red to the right (worse).
+      </p>
+      <div class="chart-box" id="board"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Validation loss over training</h2>
+      <p class="panel-sub">Real per-eval log records. Hover anywhere on the plot to read both runs at that step.</p>
+      <div class="legend" id="lossLegend"></div>
+      <div class="chart-box" id="lossCurve"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Where the tokens actually went</h2>
+      <p class="panel-sub" id="expertSub"></p>
+      <div class="chart-box" id="expertBars"></div>
+    </section>
+
+    <section class="panel hidden" id="deepdiveSection">
+      <h2 id="deepdiveTitle"></h2>
+      <p class="panel-sub">The mechanism behind the number above, with this run's own measurements.</p>
+      <div class="deepdive" id="deepdivePanel"></div>
+    </section>
+  </section>
+
+  <!-- =============== TIER 2: modernized presets =============== -->
+  <section id="tier-presets" class="hidden">
+    <p class="provenance" id="presetProvenance"></p>
+
+    <section class="panel" style="border-left:3px solid var(--variant)">
+      <h2>A different experiment from the one above</h2>
+      <p class="panel-sub" style="margin-bottom:0">
+        This tier is <em>not</em> comparable with the single-axis study: it uses a different base config
+        (<code>BASELINE</code>, d_model 256 × 6 layers, not the tiny <code>SMOKE_TEST</code>), a different
+        token slice and budget, and — crucially — it changes <em>several</em> axes at once, because the
+        question here is not "what does one knob do" but "what should the recommended configuration be after
+        the modernization spec". It also trains every variant over two seeds, so a difference can be checked
+        against seed noise instead of eyeballed.
+      </p>
+    </section>
+
+    <div class="showdown" id="presetCards"></div>
+
+    <section class="panel">
+      <h2>What changed, and why it should help</h2>
+      <p class="panel-sub">
+        Each row is one field difference against <code>BASELINE</code>, with the reasoning that motivated it.
+      </p>
+      <div class="chart-box" id="changeTable"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Validation loss over training</h2>
+      <p class="panel-sub">
+        Line is the mean across seeds; the shaded band is the real min–max envelope, so you can see directly
+        whether two runs are separated by more than seed noise.
+      </p>
+      <div class="legend" id="presetLegend"></div>
+      <div class="chart-box" id="presetCurve"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Routing load per expert</h2>
+      <p class="panel-sub">
+        Real dispatched-token counts per layer at the final logged step. <code>FINEGRAINED</code> has 32
+        narrow experts where the others have 8 wide ones, so its bars are both more numerous and individually
+        smaller — the dashed line is each model's own even share.
+      </p>
+      <div class="chart-box" id="presetExpertBars"></div>
+    </section>
+
+    <section class="panel">
+      <h2>How evenly is that load spread?</h2>
+      <p class="panel-sub">
+        One dot per layer. Coefficient of variation = std(load) / mean(load): zero means every expert received
+        an identical share, larger means the router is playing favourites.
+      </p>
+      <div class="chart-box" id="presetBalance"></div>
+    </section>
+  </section>
+
+  <footer class="foot">
+    Single-axis data from <code>runs/ablation_study/*/logs/train.jsonl</code>, regenerate with
+    <code>uv run python scripts/run_ablation_study.py --smoke</code>.
+    Preset data from <code>runs/modernized_presets/</code>, produced by
+    <code>notebooks/07_modernized_presets.ipynb</code> and written up in
+    <code>journey_of_a_model/035-modernized-presets-training-run.md</code>.
+    Open this file directly in any browser — no server, no build step, no network.
+  </footer>
+
+</div>
+
+<script src="../shared/lib/d3.min.js"></script>
+<script src="../shared/lib/katex.min.js"></script>
+<script src="data/ablation.js"></script>
+<script src="js/charts.js"></script>
+<script src="js/deep-dive.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-"""Exports real captured forward-pass traces to JS for `token_journey/`'s
+"""Exports real captured forward-pass traces to JS for `site/token-journey/`'s
 web walkthrough -- one file per variant so the page can render a
 structurally different diagram with correct real math for whichever
 architecture is selected.
@@ -456,7 +456,7 @@ def export_trace(prompt: str, output_dir: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", default="ROMEO:")
-    parser.add_argument("--output-dir", default="token_journey/data")
+    parser.add_argument("--output-dir", default="site/token-journey/data")
     args = parser.parse_args()
     export_trace(args.prompt, args.output_dir)
 
