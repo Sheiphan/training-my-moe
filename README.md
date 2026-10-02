@@ -67,6 +67,56 @@ uv run python scripts/export_trace.py                 # -> site/token-journey/da
 
 ---
 
+## Reading the docs locally, with code links that open in your editor
+
+The journal ([`journey_of_a_model/`](journey_of_a_model/)) and the math docs ([`docs/math/`](docs/math/)) link to the exact
+line of code they explain, for example [`block.py:37`](qwenmoe/model/block.py#L37). Those links are ordinary relative
+paths ending in `#L<line>`, so they work on GitHub as they are. To read the docs on your own machine and have those
+links open the file at that line in VS Code, use either of these.
+
+**In VS Code (no setup).** Open any `.md` file and press `⌘⇧V` (Ctrl+Shift+V on Linux/Windows) for the built-in
+preview. Clicking a code link opens the file in the editor at that line.
+
+**In the browser.** This is the setup used while writing these docs, in **Brave**:
+
+| Extension | Where it comes from | What it does |
+|---|---|---|
+| **Markdown Reader** | Chrome Web Store (works in Brave and Chrome) | Renders a local `.md` file in place, so the page stays at its `file:///…` address |
+| **Open code links in VS Code** | this repo: [`site/shared/vscode-links/`](site/shared/vscode-links/manifest.json), loaded unpacked | Sends clicks on code links to VS Code at the linked line |
+
+Any Markdown extension that renders the file in place on its `file:///` page works instead of Markdown Reader.
+The second extension is the small one in [`site/shared/vscode-links/`](site/shared/vscode-links/manifest.json). On local pages it turns a click on a code link,
+`…/qwenmoe/model/block.py#L37`, into `vscode://file/…/qwenmoe/model/block.py:37`, which VS Code opens at that line.
+Links to other docs, to the `site/` pages and to the web keep opening in the browser. The same works on every page
+in `site/`, including links the tensor walk adds as you step. One-time setup in Brave (Chrome is the same with
+`chrome://extensions`):
+
+1. Open `brave://extensions` and turn on **Developer mode** (top right).
+2. Click **Load unpacked** and choose the `site/shared/vscode-links` folder of this repo.
+3. On the new "Open code links in VS Code" card, click **Details** and turn on **Allow access to file URLs**. The
+   extension cannot see local files without this.
+4. In your Markdown extension's Details, make sure **Allow access to file URLs** is on as well.
+5. Open a doc, for example `docs/math/006-full-model-assembly.md`, by dragging it into the browser or opening its
+   `file:///…` path. A "VS Code links: on" badge appears in the bottom-right corner for a few seconds.
+6. Click a code link. The first time, the browser asks to open Visual Studio Code; tick **Always allow**.
+
+Hold ⌘ (Ctrl on Linux/Windows) while clicking to open a code link in the browser instead. For VS Code Insiders
+or Cursor, change `SCHEME` at the top of [`content.js`](site/shared/vscode-links/content.js) to `vscode-insiders` or
+`cursor`, then click the reload icon on the extension's card.
+
+If clicking a code link still shows the file in the browser:
+
+| What you see | Cause and fix |
+|---|---|
+| No "VS Code links: on" badge | The extension is not running on the page. Check step 3 (file URL access), and that the card is enabled. |
+| The address bar starts with `chrome-extension://`, not `file:///` | Your Markdown extension shows docs on its own page, where other extensions cannot run. Use one that renders in place, or VS Code's preview. |
+| Badge shows, the browser does nothing on click | VS Code's link handler is not registered. Open VS Code once, then test by pasting a `vscode://file/<absolute path>:1` link into the address bar. |
+| The console (⌘⌥J) shows `[open-in-vscode] click … -> (left to the browser)` | The link is not to a local code file (Markdown, HTML, images and web links are left alone on purpose). |
+
+The default browser does not matter: the browser hands `vscode://` links to VS Code directly.
+
+---
+
 ## Repository map
 
 ```
