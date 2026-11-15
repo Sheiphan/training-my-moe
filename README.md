@@ -23,7 +23,7 @@ Requires Python ≥ 3.12 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                                  # install
-uv run pytest -q                         # 541 tests
+uv run pytest -q                         # 533 tests (531 pass, 2 skip)
 
 # prepare data, train the fast smoke config, generate from it
 uv run python scripts/prepare_data.py --corpus tiny_shakespeare --tokenizer-type char
@@ -127,16 +127,16 @@ qwenmoe/            the model and training code
   tokenizer/          char + from-scratch byte-level BPE
   data/               download, tokenize, cache, fixed-slice sampling
   train/              trainer, optimizers (AdamW/Muon), schedules, scaling laws, compare
-  viz/                trace capture + scene definitions
+  viz/                trace capture (capture_trace)
 configs/presets.py  named ModelConfigs (see below)
 site/               every HTML page, one hub: index.html, model-figure/, tensor-walk/,
                     token-journey/, ablation/, architecture-map/, shared/lib (D3, KaTeX)
 docs/math/          by-hand derivations, each checked by a verify_*.py script
 scripts/            prepare_data, train, generate, run_comparison,
-                    run_ablation_study, export_trace, render_viz
+                    run_ablation_study, export_trace
 notebooks/          runnable code tour, 00 is the map
 journey_of_a_model/ 44 engineering-journal entries + figures
-tests/              541 tests
+tests/              533 tests
 ```
 
 ## Presets
@@ -192,7 +192,7 @@ This was built spec-first, and both specs are complete:
 ## Testing
 
 ```bash
-uv run pytest -q      # 386 passed
+uv run pytest -q      # 531 passed, 2 skipped
 ```
 
 The suite pins the invariant that matters most here: every modernization knob is off by default, and a model

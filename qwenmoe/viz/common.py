@@ -1,6 +1,6 @@
-"""Shared helper every Manim scene in `qwenmoe/viz/` builds on: capturing a
-real `TraceBundle` from a real trained checkpoint (Requirement 7.1), so no
-scene ever animates illustrative/fabricated numbers.
+"""Shared helper for capturing a real `TraceBundle` from a real trained
+checkpoint (Requirement 7.1), so nothing built on a trace ever shows
+illustrative/fabricated numbers.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ def capture_trace(checkpoint_path: str | Path, prompt: str) -> TraceBundle:
     """Loads `checkpoint_path`, encodes `prompt` with the exact tokenizer
     the checkpoint was trained with, and runs
     `QwenMoEModel.forward_with_trace` under `torch.no_grad()` (Requirement
-    7.1) -- the one place every Manim scene gets its real numbers from.
+    7.1) -- the one place traces get their real numbers from.
     """
     checkpoint = load_checkpoint(checkpoint_path)
     model = QwenMoEModel(checkpoint["model_config"])

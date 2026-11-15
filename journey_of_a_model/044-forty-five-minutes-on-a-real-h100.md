@@ -60,10 +60,13 @@ safe here only because the set was empty.
 
 **3. `manim` blocks `uv sync` on a clean GPU box.** It's a hard dependency
 in `pyproject.toml`, it needs `cairo.h`, and the build fails without
-`libcairo2-dev` / `libpango1.0-dev` / `pkg-config`. Manim renders the
+`libcairo2-dev` / `libpango1.0-dev` / `pkg-config`. Manim rendered the
 visualization scenes. **Training never imports it.** A dependency that
 exists to draw diagrams should not be on the critical path to a GPU that
 bills by the second — it belongs in the `notebooks` group.
+
+> *Later: rather than moving `manim` to a group, the project removed Manim
+> and all its scene code entirely.*
 
 **4. The image's torch is not the project's torch.** RunPod's PyTorch image
 ships 2.8.0+cu128; `pyproject.toml` pins `torch>=2.13.0`. `uv sync` built
@@ -288,7 +291,7 @@ Revised plan for the real run:
    memory profile.
 4. **Fix `check_capacity.py`** — vocabulary term plus the ~2x factor — or
    stop quoting its verdicts.
-5. **Move `manim` to the `notebooks` dependency group.**
+5. **Move `manim` to the `notebooks` dependency group.** *(Superseded: Manim was removed from the project entirely.)*
 
 ## The one fix that landed with this entry
 

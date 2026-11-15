@@ -44,7 +44,7 @@
   errors).
 - Added `.cache/` to `.gitignore` (downloaded/cached corpora are
   regeneratable via `download_corpus`, same rationale as the existing
-  `media/` entry for Manim render output).
+  `media/` entry for the then-present Manim render output; both were later removed).
 
 ## Design decisions worth calling out
 
@@ -116,7 +116,7 @@ mostly test that the mocks were wired correctly, not that the real URLs
 still resolve to the right content. Instead, both branches were run for
 real during this task (see Outcome) — the same "manually verify, don't
 mock" convention already used for task 10.2's training CLI and task
-13.6's Manim rendering CLI.
+13.6's rendering CLI (since removed with the rest of the Manim code).
 
 ## Concepts explained for a complete beginner
 

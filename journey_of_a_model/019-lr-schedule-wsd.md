@@ -49,8 +49,8 @@ entry 010's warmup+cosine introduction
 - **How it relates here:** exact algebra, not fitted — see the unified
   formula below, which reduces to the original decay-to-zero behavior
   exactly when `min_lr_ratio=0.0` (the function's own default, so every
-  entry-010-era caller — including `qwenmoe/viz/scenes_task10_preview.py`,
-  which still calls `lr_multiplier(step, warmup_steps, total_steps)` with
+  entry-010-era caller — including the task-10 Manim preview scene (since
+  removed), which still called `lr_multiplier(step, warmup_steps, total_steps)` with
   no new arguments — is numerically unaffected).
 
 ### Warmup-Stable-Decay (WSD): decoupling the schedule from the token budget

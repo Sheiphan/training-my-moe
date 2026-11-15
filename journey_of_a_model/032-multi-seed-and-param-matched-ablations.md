@@ -3,7 +3,7 @@
 **Type:** task · **Date:** 2026-09-04 · **Related:** `moe-modernization`
 Requirement 12.1, 12.2, 12.4; `design.md` `train/compare.py` component;
 follows up entry 008 (`make_fixed_slice` / compute-matched comparison) and
-the `extra-manim-preview-task15` preview of `run_comparison`
+the (since-removed) task-15 Manim preview of `run_comparison`
 
 > **Full derivation, solved by hand:** [`docs/math/032-multi-seed-and-param-matched-ablations.md`](../docs/math/032-multi-seed-and-param-matched-ablations.md)
 > — the sample mean/Bessel-corrected std and the `hypot` noise band derived

@@ -11,7 +11,7 @@ Each branch is a version of the project, not a feature branch. The history is me
 
 ```
 40d8f9d  Initial commit: the from-scratch model + Manim (journal 001-016)
- |-- model-development       side branch: RoPE deep-dive notebook, REMOVES Manim (2 commits)
+ |-- model-development       side branch: RoPE deep-dive notebook, an older Manim removal (2 commits)
  `-- moe-modernization       v2: journal 017-038 + docs/math  (27 commits)
       `-- scaling-improvements   v3: journal 039-041, real data, long runs  (+3)
            `-- cuda-h100            v4: journal 042-044, GPU port, first H100 session  (+3)
@@ -19,9 +19,9 @@ Each branch is a version of the project, not a feature branch. The history is me
 ```
 
 - **`moe-modernization` -> `scaling-improvements` -> `cuda-h100` are the flowing versions.** Each starts at the previous tip.
-- **`model-development` is not in the chain.** It diverged from the root. Every stacked branch still contains Manim, so merging it in would silently delete Manim from later versions.
+- **`model-development` is not in the chain.** It diverged from the root. Every older stacked branch still contains Manim as history. Manim was later removed from the latest code by a fresh commit (it conflicts with `model-development`'s older removal), so do not merge `model-development` for that.
 - **`docs-and-site` changes no model behaviour.** Treat it as the branch you present from, rebased onto the latest version, not as a version of the model.
-- **There is no `main` branch locally**, although the git config and journal 017 mention one. Journal 017 also says `moe-modernization` was branched off `model-development`; git shows the root commit.
+- **`main` is the GitHub default branch** (personal repo `Sheiphan/training-my-moe`, remote `origin`) and follows the latest tip, `docs-and-site`. Journal 017 mentions a `main` too. Journal 017 also says `moe-modernization` was branched off `model-development`; git shows the root commit.
 - Journal 042 is the only entry that explains a branch split ("Why a new branch?").
 
 ## Goal: one commit per version

@@ -15,7 +15,7 @@ expansion per step.
 **Inference.** One real forward pass, one real token, exactly like today.
 Training would need a completely different data model (loss over time,
 gradients, optimizer state) — this repo already covers that separately
-(`qwenmoe/viz/scenes_training.py`, run-level JSON-lines logs), so it's out
+(run-level JSON-lines logs under `runs/`), so it's out
 of scope here.
 
 ## What research says about *how*
@@ -48,7 +48,7 @@ that's already working.
 ## New real data required (block 0 only — the one block shown in detail)
 `scripts/export_trace.py` currently exports activations only. Needs a
 small, additive extension (new `weights` key, same file), loading the real
-model object the same way `qwenmoe/viz/scenes_embedding.py` already does
+model object the same way `qwenmoe/viz/common.py::capture_trace` does
 (per repo memory: "a local `_load` helper that duplicates `capture_trace`'s
 body but also returns the model") so real `nn.Linear`/`RMSNorm` weights can
 be read directly — never re-derived or guessed:

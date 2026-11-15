@@ -887,7 +887,7 @@ figures.
 - **Then why keep `forward_with_trace` slow on purpose?** A fused kernel's
   entire point is to *never materialise* the $(S, S)$ score matrix — but
   that matrix (`attn_scores_pre_mask` / `attn_scores_post_softmax`) is
-  exactly what the Manim attention scene animates (journal 013). Fusing
+  exactly what the since-removed Manim attention scene animated. Fusing
   the trace path would leave it nothing to show.
 
 - **$\alpha = 0$ for the very first block — is that a bug?** No. Formally

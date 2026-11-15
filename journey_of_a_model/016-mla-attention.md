@@ -313,15 +313,15 @@ flowchart LR
   for task 3's `RotaryEmbedding` to rotate it at all (it pairs up
   dimensions) — `head_dim` divisible by 4 is exactly the condition that
   guarantees `head_dim // 2` comes out even.
-- **Could `MLAAttention` be visualized with the existing task 12-14 Manim
+- **Could `MLAAttention` be visualized with the existing task 12-14 tracing
   pipeline?** Not without changes: `LayerTrace.k`/`v` are typed and shaped
   for GQA's `n_kv_heads`, and `MLAAttention` has no `forward_with_trace`
   method at all — `TransformerBlock.forward_with_trace` would raise
   `AttributeError` if ever called on an MLA-configured block. This is a
   deliberate, documented scope limit (task 16's checklist asks only for
   the module and `tests/test_mla.py`, not tracing), not an oversight — no
-  formal Manim scene ever loads an MLA checkpoint, since every one of them
-  sources real numbers from the SMOKE_TEST checkpoint (GQA + RoPE).
+  formal visualization ever loaded an MLA checkpoint, since every one of them
+  sourced real numbers from the SMOKE_TEST checkpoint (GQA + RoPE).
 - **Was a new ablation preset (like task 15's `POS_NOPE`/`MOE_LOSSFREE`)
   added so `scripts/run_comparison.py` could compare attention variants
   too?** Considered and deliberately not done — task 15 added presets

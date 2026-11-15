@@ -61,7 +61,7 @@ automatically, with zero changes needed to `Trainer` itself. It also means
 `Trainer._evaluate`'s validation-only forward passes (which call
 `model.eval()` first) never perturb the bias using validation-set load
 statistics — the same reason `BatchNorm` freezes its running stats during
-`.eval()`. `forward_with_trace` (used only for Manim/inference tracing,
+`.eval()`. `forward_with_trace` (used only for visualization/inference tracing,
 never training) deliberately never calls `update()` at all, regardless of
 `self.training`, so a visualization pass can never silently mutate a
 loaded checkpoint's learned bias.

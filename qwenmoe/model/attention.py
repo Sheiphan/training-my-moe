@@ -4,9 +4,9 @@ and a swappable positional scheme (Requirements 1.5, 1.6, 12.1).
 `forward` (the path every real training/inference call uses) runs fused
 `F.scaled_dot_product_attention` (moe-modernization Requirement 7.1-7.2,
 task 5); `forward_with_trace` (only ever called by
-`viz/scenes_*.py`/`TransformerBlock.forward_with_trace`) keeps the
+`viz/common.py::capture_trace`/`TransformerBlock.forward_with_trace`) keeps the
 original explicit matmul/mask/softmax/matmul steps so every intermediate
-tensor stays inspectable for the Manim scenes -- the two are numerically
+tensor stays inspectable for the trace consumers -- the two are numerically
 equivalent within `1e-5`, not bit-identical, since a fused kernel is free
 to sum in a different order (`tests/test_trace.py`).
 """

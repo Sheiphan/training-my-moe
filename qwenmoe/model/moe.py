@@ -104,7 +104,7 @@ def score_and_select(
 
     In both cases `topk_weights` sums to 1 per token (Requirement 4.6) and
     `routing_probs` is a per-token distribution over every routed expert, so
-    `AuxLossBalancer.aux_loss` and the Manim trace see the same shape and
+    `AuxLossBalancer.aux_loss` and the forward trace see the same shape and
     semantics regardless of `scoring`.
     """
     if scoring == "softmax":

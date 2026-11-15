@@ -30,7 +30,7 @@ follows up entry 006 (the MoE layer) and entry 009 (the expert dispatch loop)
   bias update, shared experts, `_add_router_z_loss`,
   `_add_seq_balance_loss` — is unchanged.
 - **`MoELayer.forward_with_trace` keeps the explicit per-expert loop**
-  (Requirement 5.4) so the Manim scenes still get one `expert_outputs[e]`
+  (Requirement 5.4) so the trace consumers still get one `expert_outputs[e]`
   tensor per dispatched expert.
 - **Deliberate deviation from `design.md`.** The design's *primary*
   suggestion was to store routed-expert weights as 3-D `nn.Parameter`s
@@ -46,7 +46,7 @@ follows up entry 006 (the MoE layer) and entry 009 (the expert dispatch loop)
     Requirement 1.4 wants; a 3-D parameter would have needed a batched
     Newton-Schulz;
   - **`moe.routed_experts[i]` still works** — `qwenmoe/train/scaling.py`,
-    `qwenmoe/viz/scenes_norm_act.py`, `scripts/export_trace.py` and
+    `scripts/export_trace.py` and
     several tests index it as a list; none had to change.
 
   The only cost is a `torch.stack` of this step's active-expert weights on
@@ -205,7 +205,7 @@ behavior change.
   exists to prevent. MegaBlocks (below) removes the padding entirely with
   custom block-sparse GPU kernels; that's out of scope for a dependency-free
   CPU/MPS project.
-- **Why keep the explicit loop in `forward_with_trace`?** The Manim scenes
+- **Why keep the explicit loop in `forward_with_trace`?** The trace consumers
   want one clearly-labelled output tensor *per expert*
   (`expert_outputs[e]`), and the batched grid interleaves them. Requirement
   5.4 explicitly permits the trace path to stay explicit "for clarity". The

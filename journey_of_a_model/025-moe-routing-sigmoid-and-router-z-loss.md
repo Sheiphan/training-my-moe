@@ -46,7 +46,7 @@ this spec routes bit-identically to today.
 - **Trace** — `forward_with_trace`'s `trace["router_probs"]` now holds
   `routing_probs` (the softmax distribution, or the normalized-sigmoid
   distribution). Same shape `(n_tokens, n_routed_experts)`, same "sums to 1"
-  contract, so the Manim scenes and `test_trace.py` are unaffected.
+  contract, so the trace consumers and `test_trace.py` are unaffected.
 - **Tests** — 12 new (`tests/test_moe.py` ×10, `tests/test_model.py` ×2
   parametrized): softmax path byte-identical to pre-spec; sigmoid selects
   exactly `k` and both `topk_weights` and `routing_probs` sum to 1;

@@ -1190,9 +1190,9 @@ game.
   a deliberate documented exception. `test_mla.py::test_mla_ignores_positional_scheme_and_always_uses_decoupled_rope`
   pins this.
 
-- **Could this be run through the Manim visualiser like GQA?** Not without
+- **Could this be run through the trace visualisations like GQA?** Not without
   changes — `LayerTrace.k`/`v` are typed for GQA's `n_kv_heads`, and no
-  Manim scene loads an MLA checkpoint. `MLAAttention.forward_with_trace`
+  scene ever loaded an MLA checkpoint (Manim scenes, since removed). `MLAAttention.forward_with_trace`
   exists (we just walked it) but nothing in `viz/` calls it. Scope limit,
   not oversight — see the journal entry.
 

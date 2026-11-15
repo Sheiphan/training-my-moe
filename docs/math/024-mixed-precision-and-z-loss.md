@@ -832,7 +832,7 @@ keeps an older, explicit per-expert Python loop instead of
 `dispatch_batched`, and its own scatter-add
 ([`moe.py:555`](../../qwenmoe/model/moe.py#L555)) does **not** carry the
 `.to(routed_output.dtype)` cast. This is harmless *today* only because
-`forward_with_trace` is used solely for the Manim-visualization / doc
+`forward_with_trace` is used solely for the visualization / doc
 trace path, which this codebase never calls from inside an autocast
 context — it is worth flagging honestly (this document's own "no
 fabricated numbers" rule cuts both ways: a claim that every scatter-add in

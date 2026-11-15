@@ -46,15 +46,15 @@ There is no linter or formatter configured. `main.py` is a placeholder.
 - `tokenizer/`: `CharTokenizer` and a from-scratch byte-level BPE, behind a `build_tokenizer` factory
 - `data/`: corpus download, tokenize, cache, `TokenDataset`, fixed-slice and step-offset samplers
 - `train/`: `trainer.py` (the large one: `Trainer`, `lr_multiplier`, checkpointing and pruning, JSON-lines logging), `optim.py` (AdamW param groups, Muon, `CombinedOptimizer`), `scaling.py` (param counts, Chinchilla budget), `compare.py` (compute-matched comparisons)
-- `viz/`: trace capture and Manim scenes (Manim output goes to the git-ignored `media/`)
+- `viz/`: trace capture (`capture_trace`), used by `scripts/export_trace.py` and the trace tests
 
 `scripts/train.py` builds `TrainConfig` by matching argparse destinations to dataclass field names, and a test fails if any `TrainConfig` field becomes unreachable from the CLI. Adding a `TrainConfig` field means adding a flag for it.
 
-**Gitignored inputs.** `runs/` (checkpoints and logs), `.cache/` (prepared corpora), `media/` and `content/` are not tracked. The generated site data is committed, but regenerating it (`scripts/render_model_figure.py`, `render_tensor_walk.py`, `run_ablation_study.py`, `export_trace.py`, `docs/math/build_architecture_footer.py`) needs a local training run first. The two `render_*` scripts also shell out to `node`. `check_site.py` should pass after any change under `site/`.
+**Gitignored inputs.** `runs/` (checkpoints and logs), `.cache/` (prepared corpora) and `content/` are not tracked. The generated site data is committed, but regenerating it (`scripts/render_model_figure.py`, `render_tensor_walk.py`, `run_ablation_study.py`, `export_trace.py`, `docs/math/build_architecture_footer.py`) needs a local training run first. The two `render_*` scripts also shell out to `node`. `check_site.py` should pass after any change under `site/`.
 
 ## Branches are versions
 
-Branches stack as project versions: root -> `moe-modernization` -> `scaling-improvements` -> `cuda-h100` -> `docs-and-site`, with `model-development` as a separate side branch (it removes Manim). There is no `main`. The plan is one squashed commit per version, which rewrites every branch above the one squashed. Use the `branch-versions` skill before squashing, rebasing or adding a branch.
+Branches stack as project versions: root -> `moe-modernization` -> `scaling-improvements` -> `cuda-h100` -> `docs-and-site`, with `model-development` as a separate side branch. `main` is the GitHub default branch and follows the latest tip (`docs-and-site`). Manim was removed from the project's latest code; the older version branches still contain it as history. The plan is one squashed commit per version, which rewrites every branch above the one squashed. Use the `branch-versions` skill before squashing, rebasing or adding a branch.
 
 ## Docs conventions (journal and math docs)
 

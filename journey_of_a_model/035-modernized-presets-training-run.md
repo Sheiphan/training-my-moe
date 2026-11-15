@@ -265,7 +265,7 @@ across more of the pool by construction.
 ![Standard deviation of pre-softmax attention logits by layer](figures/035/attn_logit_scale.png)
 
 A real forward-pass trace (`QwenMoEModel.forward_with_trace`, the path
-every Manim scene uses) on a 42-token prompt, reading
+every trace consumer uses) on a 42-token prompt, reading
 `std(attn_scores_pre_mask)` layer by layer:
 
 | variant | per-layer logit std | max &#124;logit&#124; |

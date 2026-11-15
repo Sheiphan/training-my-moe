@@ -286,8 +286,8 @@ def _modern_probe(run_dir: Path, prompt: str = "ROMEO:\nWhat is the cause of thi
 
 def _read_log(log_path: Path) -> dict:
     """Parses a `Trainer`-written `train.jsonl` -- same record schema
-    `qwenmoe/viz/scenes_training.py::load_training_log` reads, reimplemented
-    locally so this script doesn't need to import `manim`. Returns the
+    the training logs always use, parsed locally with only the standard
+    library. Returns the
     step-by-step curve data PLUS the final metrics and a real measured
     tokens/sec (mean of every logged step's `elapsed_s`, the actual
     per-step wall-clock time `Trainer.fit` recorded during this exact run
@@ -348,8 +348,8 @@ def _read_log(log_path: Path) -> dict:
 
 def _bias_mechanism_demo() -> dict:
     """Real `LossFreeBalancer` bias-nudge loop over 40 rounds -- the same
-    mechanism `qwenmoe/viz/scenes_task15_preview.py` already visualizes in
-    Manim, captured here as real numbers for the web deep-dive rather than
+    mechanism journal 015 describes, captured here as real numbers for the
+    web deep-dive rather than
     re-derived or approximated."""
     balancer = LossFreeBalancer(n_routed_experts=4, update_rate=0.05)
     logits = torch.tensor([[5.0, 1.0, 1.0, -5.0]])

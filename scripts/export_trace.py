@@ -7,8 +7,8 @@ Sources every number from a real trained checkpoint -- activations via
 `QwenMoEModel.forward_with_trace` (the project's one trace-capture path)
 plus, for the matrix-multiplication deep-dive, real block-0 weight
 matrices and real RMSNorm outputs read directly off the live model (the
-same "local helper that also returns the model" pattern
-`qwenmoe/viz/scenes_embedding.py` already established) -- never a
+same "local helper that also returns the model" pattern,
+loading the checkpoint the way `capture_trace` does) -- never a
 fabricated or illustrative number (Requirement 7.1 convention).
 
 Two families of variant ship side by side:

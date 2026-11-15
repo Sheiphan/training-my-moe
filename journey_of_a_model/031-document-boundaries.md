@@ -298,7 +298,7 @@ no document is ever split between train and val.
   parameter and the same `attn_mask` addition. Tested: a document-1 token
   is fully isolated from a document-0 perturbation under MLA too.
 - **Does the trace path (`forward_with_trace`) support this?** No, and it
-  doesn't need to — the Manim scenes visualize a single clean prompt, not
+  doesn't need to — the visualizations show a single clean prompt, not
   a packed training batch. `forward_with_trace` is unchanged; document
   masking is exercised through `forward` and its own tests, the same
   decision entry 013 made for the KV cache.

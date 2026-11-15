@@ -23,7 +23,7 @@ keeping the parent spec's implementation as a frozen reference.
 tests going in), and dependency-minimal — there's no defect driving a
 rewrite, only a gap against newer published techniques. A rewrite would
 also orphan every `journey_of_a_model` entry's worked examples and the
-`forward_with_trace`/Manim visualization pipeline, which is the project's
+`forward_with_trace` visualization pipeline (Manim scenes at the time, later removed), which is the project's
 actual pedagogical core. **Decision:** incremental modernization, staged so
 every change is one of three kinds (see `requirements.md`'s Introduction):
 a **pure win** (changes the default path directly — e.g. fused attention,

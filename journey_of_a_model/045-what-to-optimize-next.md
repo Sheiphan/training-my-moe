@@ -337,7 +337,8 @@ per dollar.
   4GB mmap with a cold page cache means a page fault per window on the
   training thread. It was a 24GB-Mac accommodation (entry 040); a GPU box has
   RAM to spare.
-- **Move `manim` to the `notebooks` group.** Entry 044's finding: a hard
+- **Move `manim` to the `notebooks` group.** *(Superseded: Manim was removed from the
+  project entirely.)* Entry 044's finding: a hard
   dependency needing `cairo.h` that training never imports, blocking
   `uv sync` on a machine billing by the second.
 

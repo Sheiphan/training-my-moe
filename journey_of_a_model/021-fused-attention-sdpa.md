@@ -31,7 +31,7 @@ builds on entry 004's original GQA implementation
   k, v, is_causal=True)` call.
 - **`forward_with_trace`** on both classes is untouched -- still the
   explicit `Q·Kᵀ → mask → softmax → ·V` steps, still capturing
-  `attn_scores_pre_mask`/`attn_scores_post_softmax` for the Manim scenes.
+  `attn_scores_pre_mask`/`attn_scores_post_softmax` for the trace consumers.
 - **Tests**: the two pre-existing "`forward` and `forward_with_trace` are
   bit-for-bit identical" tests became tolerance-based
   (`torch.allclose(..., atol=1e-5)`) and the GQA one is now parametrized
@@ -74,7 +74,7 @@ builds on entry 004's original GQA implementation
   ever needs a shelf big enough for the whole order.
 - **How it relates here:** this project's `Attention.forward` is the path
   every real `Trainer.fit`/`generate()` call uses; `forward_with_trace` is
-  only ever called by the Manim visualization pipeline (entry 012),
+  only ever called by the visualization/trace pipeline (entry 012),
   specifically *because* it needs the full, explicit intermediate score
   matrix to animate. Task 5 makes `forward` fast (fused) while keeping
   `forward_with_trace` explicit (teachable) — exactly the split
@@ -167,7 +167,7 @@ project's tiny configs don't reach.
   it?** Because a fused kernel's entire point is to *never materialize*
   the intermediate score matrix — but that intermediate matrix (captured
   as `attn_scores_pre_mask`/`attn_scores_post_softmax`) is exactly what
-  the Manim attention scene (entry 013) animates. Fusing
+  the (since-removed) Manim attention scene of entry 013 animated. Fusing
   `forward_with_trace` would mean it has nothing left to show.
 - **What happened to the old `repeat_interleave` calls?** They're gone
   from `forward` (SDPA's `enable_gqa=True` does the equivalent broadcast
