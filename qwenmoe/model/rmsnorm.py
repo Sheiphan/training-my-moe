@@ -15,3 +15,9 @@ class RMSNorm(nn.Module):
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         x_normed = x * torch.rsqrt(variance + self.eps)
         return x_normed * self.weight
+
+if __name__ == "__main__":
+    # Example usage
+    x = torch.randn(2, 3, 4)
+    rmsnorm = RMSNorm(dim=4)
+    print(rmsnorm(x))

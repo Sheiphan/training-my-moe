@@ -571,3 +571,14 @@ class MoELayer(nn.Module):
             "expert_outputs": expert_outputs,
         }
         return output, aux_loss, trace
+
+if __name__ == "__main__":
+    from qwenmoe.config import ModelConfig
+
+    config = ModelConfig(vocab_size=50, d_model=16, d_ff=32, n_routed_experts=4, n_shared_experts=1, top_k=1, max_seq_len=8)
+    moe_layer = MoELayer(config)
+    x = torch.randn(2, 4, config.d_model)
+    output, aux_loss, trace = moe_layer.forward_with_trace(x)
+    print("Output shape:", output.shape)
+    print("Auxiliary loss:", aux_loss)
+    print("Trace:", trace)  

@@ -429,3 +429,24 @@ def build_attention(config: ModelConfig) -> nn.Module:
     if config.attention_variant == "mla":
         return MLAAttention(config)
     raise ValueError(f"Unknown attention_variant: {config.attention_variant!r}")
+
+if __name__ == "__main__":
+    # Minimal demo for GQA: construct a lightweight config-like object
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(
+        attention_variant="gqa",
+        n_heads=8,
+        n_kv_heads=2,
+        d_model=512,
+        positional_scheme="rope",
+        qk_norm=False,
+        rope_theta=10000.0,
+        mla_latent_dim=None,
+    )
+
+    attn = build_attention(cfg)
+    x = torch.randn(1, 4, cfg.d_model)
+    positions = torch.arange(4)
+    out = attn(x, positions)
+    print("GQA demo output shape:", out.shape)

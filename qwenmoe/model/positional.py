@@ -141,3 +141,15 @@ def _alibi_slopes(n_heads: int) -> list[float]:
     base = _slopes_for_power_of_2(closest_pow2)
     extra = _slopes_for_power_of_2(2 * closest_pow2)[0::2][: n_heads - closest_pow2]
     return base + extra
+
+if __name__ == "__main__":
+    # RoPE demo
+    head_dim = 8
+    rope = RotaryEmbedding(head_dim)
+    positions = torch.arange(4)
+    angles = rope.positional_trace(positions)
+    print(f"RoPE angles shape: {angles.shape}")
+    q = torch.randn(1, positions.shape[0], head_dim)
+    k = torch.randn(1, positions.shape[0], head_dim)
+    q_rot, k_rot = rope.apply_to_qk(q, k, positions)
+    print(f"q_rot shape: {q_rot.shape}, k_rot shape: {k_rot.shape}")
