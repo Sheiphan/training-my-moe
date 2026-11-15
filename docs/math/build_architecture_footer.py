@@ -74,6 +74,9 @@ NODES: dict[str, tuple[str, int, str, int | None]] = {
     "BAL": ("Expert load, CV, routing entropy", 35, "tool", None),
     "SPREAD": ("Attention-logit spread", 36, "tool", None),
     "CAP": ("Capacity check: params, memory, KV", 37, "tool", None),
+    "STREAM": ("Incremental BPE trainer + streamed corpus prep", 39, "data", None),
+    "SAMPLER": ("StepOffsetSampler + checkpoint retention", 41, "train", None),
+    "ROOF": ("MFU + roofline: why the MoE dispatch is slow", 44, "tool", None),
 }
 
 GROUPS = [
@@ -118,6 +121,8 @@ EDGES: list[tuple[str, str, str, str, int | None]] = [
     ("HEAD", "GEN", "logits", SOLID, None), ("GEN", "IDS", "append token", DOT, None),
     ("SAMP", "GEN", "", DOT, None), ("GEN", "KVC", "", DOT, None),
     ("ROUTER", "BAL", "", DOT, None), ("ATTN", "SPREAD", "", DOT, None),
+    ("STREAM", "TOK", "merges, faster", DOT, None), ("STREAM", "DATA", "int32 tokens", DOT, None),
+    ("SAMPLER", "DATA", "window offsets", DOT, None), ("ROOF", "BATCH", "explains its cost", DOT, None),
 ]
 
 # n -> (short title, what it adds, code, example/continuity note)
@@ -212,6 +217,15 @@ DOCS: dict[int, tuple[str, str, str, str]] = {
     38: ("Gradient accumulation", "why naively accumulating micro-batches changes the aux loss, and the fair re-match",
          "qwenmoe/train/trainer.py",
          "**Reuses family D** (006/010's model; window A is 010's canonical window, plus a second window)."),
+    39: ("Incremental BPE and streaming prep", "the pair table updated instead of recounted, and why block-wise encoding equals whole-corpus encoding (conditionally)",
+         "qwenmoe/tokenizer/bpe.py, scripts/prepare_data.py",
+         "Fresh text (`low low … widest_`); also covers journal 040. Builds on 007's textbook BPE."),
+    41: ("Step-offset sampler, long-run arithmetic", "a seed mixer, with-replacement coverage and duplicates, validation coverage, checkpoint bytes and retention",
+         "qwenmoe/data/sampler.py, qwenmoe/train/trainer.py",
+         "No model needed: window-count arithmetic on the real 899,396,383-window split, the real sampler and the real pruner."),
+    44: ("MFU and the roofline", "FLOPs per token, MFU from measured throughput, the profile shares, bytes-moved vs bandwidth, and the capacity-factor tail",
+         "qwenmoe/model/moe.py, qwenmoe/train/scaling.py",
+         "**Reuses the real `SCALE_300M` preset** (not a toy); measured H100 figures enter as labelled inputs. Also covers journal 045."),
 }
 
 
@@ -262,6 +276,9 @@ REFS: dict[str, tuple[str, str]] = {
     "BAL": ("scripts/export_trace.py", r"^def _layer_stats"),
     "SPREAD": ("scripts/export_trace.py", r"^def _layer_stats"),
     "CAP": ("scripts/check_capacity.py", r"^def estimate_params"),
+    "STREAM": ("qwenmoe/tokenizer/bpe.py", r"^class ByteBPETokenizer"),
+    "SAMPLER": ("qwenmoe/data/sampler.py", r"^class StepOffsetSampler"),
+    "ROOF": ("qwenmoe/model/moe.py", r"^def dispatch_batched"),
 }
 ROOT = HERE.parent.parent
 
@@ -344,6 +361,8 @@ STEPS: dict[str, str] = {
     "ABL": r"^## Part 3 — The code", "BUDG": r"^## Part 4 — `moe_budget_note`",
     "PRES": r"^## Part 2 — The segmentation", "BAL": r"^## Part 3 — Expert load",
     "SPREAD": r"^## Part 2 — The forward pass, then", "CAP": r"^## Part 2 — `estimate_params`",
+    "STREAM": r"^## Part 3 — The pair table", "SAMPLER": r"^## Part 2 — Resume is a pure function",
+    "ROOF": r"^## Part 4 — The roofline",
 }
 
 
@@ -398,11 +417,12 @@ ERAS = [
     ("foundation", "Foundation (004-011): the base model and its loop", "#bfdbfe", "#1d4ed8"),
     ("modern", "Modernization (016-031): attention, optimizer, init, routing, decoding", "#bbf7d0", "#15803d"),
     ("evaluation", "Evaluation and scale (032-038): ablations, presets, capacity", "#e9d5ff", "#7e22ce"),
+    ("hardware", "Real data and hardware (039-044): corpus, long runs, the H100", "#fed7aa", "#c2410c"),
 ]
 
 
 def era(n: int) -> str:
-    return "foundation" if n <= 11 else "modern" if n <= 31 else "evaluation"
+    return "foundation" if n <= 11 else "modern" if n <= 31 else "evaluation" if n <= 38 else "hardware"
 
 
 def class_defs() -> list[str]:
@@ -460,7 +480,7 @@ def mermaid(n: int, highlight: bool = True) -> str:
 
 
 def legend(n: int | None = None) -> str:
-    sw = {"foundation": "🟦", "modern": "🟩", "evaluation": "🟪"}
+    sw = {"foundation": "🟦", "modern": "🟩", "evaluation": "🟪", "hardware": "🟧"}
     parts = ["🟨 **introduced by this doc**"] if n else []
     parts += [f"{sw[k]} {title.split(':')[0]}" for k, title, *_ in ERAS]
     return "**Colour key:** " + " · ".join(parts) + ". Dotted lines are optional or alternative paths."
@@ -583,7 +603,7 @@ def _md_inline(text: str) -> str:
     return t
 
 
-ERA_SHORT = {"foundation": "Foundation", "modern": "Modernization", "evaluation": "Evaluation & scale"}
+ERA_SHORT = {"foundation": "Foundation", "modern": "Modernization", "evaluation": "Evaluation & scale", "hardware": "Real data & hardware"}
 
 
 def html_page() -> str:
@@ -656,6 +676,7 @@ PAGE = r"""<!doctype html>
   --f-fill:#D7E6F8; --f-stroke:#2A5DB0;       /* foundation */
   --m-fill:#D3EFDF; --m-stroke:#1F7A4A;       /* modernization */
   --e-fill:#E7DEFA; --e-stroke:#6B3FB8;       /* evaluation & scale */
+  --h-fill:#FDE3CF; --h-stroke:#C2410C;       /* real data & hardware */
   --display:"IBM Plex Sans Condensed","Arial Narrow",system-ui,sans-serif;
   --body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
   --mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,monospace;
@@ -685,6 +706,7 @@ h1{font:700 clamp(28px,4vw,40px)/1.05 var(--display);letter-spacing:-.01em;margi
 .sw.foundation{background:var(--f-fill);border-color:var(--f-stroke)}
 .sw.modern{background:var(--m-fill);border-color:var(--m-stroke)}
 .sw.evaluation{background:var(--e-fill);border-color:var(--e-stroke)}
+.sw.hardware{background:var(--h-fill);border-color:var(--h-stroke)}
 .sw.future{background:transparent;border:2px dashed #B9AF97}
 
 /* timeline */
@@ -738,6 +760,7 @@ h1{font:700 clamp(28px,4vw,40px)/1.05 var(--display);letter-spacing:-.01em;margi
 .erachip.foundation{background:var(--f-fill);border-color:var(--f-stroke)}
 .erachip.modern{background:var(--m-fill);border-color:var(--m-stroke)}
 .erachip.evaluation{background:var(--e-fill);border-color:var(--e-stroke)}
+.erachip.hardware{background:var(--h-fill);border-color:var(--h-stroke)}
 
 /* schematic + spec sheet: full-bleed board, pan/zoom canvas, floating spec sheet */
 .stage{padding-inline:20px}
@@ -937,6 +960,7 @@ function source() {
     "  classDef foundation fill:#D7E6F8,stroke:#2A5DB0,stroke-width:1.5px,color:#1E2430",
     "  classDef modern fill:#D3EFDF,stroke:#1F7A4A,stroke-width:1.5px,color:#1E2430",
     "  classDef evaluation fill:#E7DEFA,stroke:#6B3FB8,stroke-width:1.5px,color:#1E2430",
+    "  classDef hardware fill:#FDE3CF,stroke:#C2410C,stroke-width:1.5px,color:#1E2430",
     "  classDef cur fill:#F6D77A,stroke:#9A6200,stroke-width:3px,color:#1E2430,font-weight:600",
     "  classDef future fill:#F5F1E6,stroke:#B9AF97,stroke-width:1px,stroke-dasharray:4 3,color:#8C8574",
     "  classDef note fill:#FBF9F3,stroke:#B9AF97,stroke-dasharray:2 2,color:#555B66",
@@ -1276,6 +1300,10 @@ NOTATION: dict[int, list[tuple[str, str]]] = {
     37: [("$E$", "$N$ (`n_routed_experts`)")],
     38: [("$n$", "$N$ (`n_routed_experts`)"),
          ("$N$", "the number of tokens in a batch, $\\text{batch}\\times S$; **not** the number of experts in this doc")],
+    39: [("$N$", "the total number of tokens in the encoded corpus; **not** the number of experts $N$ (`n_routed_experts`)")],
+    41: [("$L$", "$S$ (`seq_len`); **not** the number of layers $L$ (`n_layers`)")],
+    44: [("$E$", "$N$ (`n_routed_experts`)"),
+         ("$T$", "the number of tokens in a micro-batch, $\\text{batch}\\times S$; **not** the per-sequence length of docs 005/026/027/035")],
 }
 NOTE_START = "<!-- notation:start (generated by build_architecture_footer.py) -->"
 NOTE_END = "<!-- notation:end -->"

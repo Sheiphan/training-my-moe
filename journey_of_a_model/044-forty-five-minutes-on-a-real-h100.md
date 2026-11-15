@@ -2,6 +2,10 @@
 
 **Type:** experiment (first real GPU session) · **Date:** 2026-09-19
 
+> **Full derivation:** [`docs/math/044-mfu-and-the-roofline.md`](../docs/math/044-mfu-and-the-roofline.md) — every
+> derived number here (FLOPs/token, MFU, hours, profile shares) recomputed from the real model. Recomputing found one
+> table row and two rounded figures that differ slightly from this entry; see that doc's Part 7.
+
 > Everything below was measured on a rented NVIDIA H100 80GB HBM3
 > (sm_90, driver 580.126.09, CUDA 13.0, torch 2.13.0+cu130) in RunPod's
 > `AP-IN-1` datacenter, SECURE tier, for about 45 minutes at $3.49/hr —

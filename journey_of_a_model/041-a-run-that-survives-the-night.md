@@ -2,6 +2,10 @@
 
 **Type:** tooling (direct follow-up to 040) · **Date:** 2026-09-18
 
+> **Full derivation:** [`docs/math/041-step-offset-sampler-and-long-run-arithmetic.md`](../docs/math/041-step-offset-sampler-and-long-run-arithmetic.md)
+> — `fold_seed` by hand, the with-replacement arithmetic (including the fraction of tokens never seen), the
+> validation-coverage fix, and the checkpoint-retention arithmetic, all checked against the real code.
+
 ## TL;DR
 
 - **The blocker 040 named:** `DataLoader(shuffle=True)` over a stride-1

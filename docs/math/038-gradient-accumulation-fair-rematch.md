@@ -646,7 +646,7 @@ from cross-entropy's own linearity (Part 3) rather than from a citation.
 
 ## Where this fits in the architecture (the growing view)
 
-← previous: [037 Capacity check](037-scale-presets-and-capacity-check.md) · next: (none yet: journal entries 039+ have no math doc)
+← previous: [037 Capacity check](037-scale-presets-and-capacity-check.md) · next: [039 Incremental BPE and streaming prep](039-bpe-incremental-counts-and-streaming.md) →
 
 **This doc adds to the architecture:** why naively accumulating micro-batches changes the aux loss, and the fair re-match. (Code: `qwenmoe/train/trainer.py`.)
 
@@ -662,7 +662,7 @@ from cross-entropy's own linearity (Part 3) rather than from a citation.
 
 The diagram is cumulative: every box derived by this doc or an earlier one is shown, and components from later docs are not drawn yet, so reading the docs in order replays how the architecture grew. The top box is this doc's title and what it adds. The [full final architecture](architecture-evolution.md) has everything.
 
-**Colour key:** 🟨 **introduced by this doc** · 🟦 Foundation (004-011) · 🟩 Modernization (016-031) · 🟪 Evaluation and scale (032-038). Dotted lines are optional or alternative paths.
+**Colour key:** 🟨 **introduced by this doc** · 🟦 Foundation (004-011) · 🟩 Modernization (016-031) · 🟪 Evaluation and scale (032-038) · 🟧 Real data and hardware (039-044). Dotted lines are optional or alternative paths.
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"background": "#F5F1E6", "clusterBkg": "#F5F1E6", "clusterBorder": "#a8a29e", "edgeLabelBackground": "#F5F1E6", "primaryTextColor": "#1f2937", "lineColor": "#57534e"}}}%%
@@ -783,6 +783,7 @@ flowchart TB
   classDef foundation fill:#bfdbfe,stroke:#1d4ed8,color:#1f2937
   classDef modern fill:#bbf7d0,stroke:#15803d,color:#1f2937
   classDef evaluation fill:#e9d5ff,stroke:#7e22ce,color:#1f2937
+  classDef hardware fill:#fed7aa,stroke:#c2410c,color:#1f2937
   classDef cur fill:#fde68a,stroke:#b45309,stroke-width:4px,color:#111827,font-weight:bold
   classDef desc fill:#FBF9F3,stroke:#9ca3af,color:#111827,text-align:left
   class TOK,DATA,IDS,EMB,FNORM,HEAD,AUXC,N1,POS,ATTN,R1,N2,ROUTER,EXPERTS,SHARED,AUXLOSS,R2,LOSS,OPT,GEN,SCALE foundation

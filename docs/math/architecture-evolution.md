@@ -4,7 +4,7 @@
 
 Read each doc's own footer to see only what existed at that point. Colours show the era each box was introduced in; boxes are grouped by where they live in the code (`qwenmoe/data`, `model`, `train`, and so on).
 
-**Colour key:** 🟦 Foundation (004-011) · 🟩 Modernization (016-031) · 🟪 Evaluation and scale (032-038). Dotted lines are optional or alternative paths.
+**Colour key:** 🟦 Foundation (004-011) · 🟩 Modernization (016-031) · 🟪 Evaluation and scale (032-038) · 🟧 Real data and hardware (039-044). Dotted lines are optional or alternative paths.
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"background": "#F5F1E6", "clusterBkg": "#F5F1E6", "clusterBorder": "#a8a29e", "edgeLabelBackground": "#F5F1E6", "primaryTextColor": "#1f2937", "lineColor": "#57534e"}}}%%
@@ -13,6 +13,7 @@ flowchart TB
     TOK["BPE tokenizer"]
     DATA["Data pipeline: pack, split, windows"]
     IDS["input_ids"]
+    STREAM["Incremental BPE trainer + streamed corpus prep"]
   end
   subgraph G_model["Model"]
     EMB["Embedding"]
@@ -51,6 +52,7 @@ flowchart TB
     AUTOCAST["bf16 autocast"]
     ZLOSS["Output z-loss"]
     GACC["Gradient accumulation (fair re-match)"]
+    SAMPLER["StepOffsetSampler + checkpoint retention"]
   end
   subgraph G_infer["Inference"]
     GEN["generate(): decode loop"]
@@ -64,6 +66,7 @@ flowchart TB
     BAL["Expert load, CV, routing entropy"]
     SPREAD["Attention-logit spread"]
     CAP["Capacity check: params, memory, KV"]
+    ROOF["MFU + roofline: why the MoE dispatch is slow"]
   end
   POS --> ATTN
   TOK -->|encode| IDS
@@ -118,14 +121,20 @@ flowchart TB
   GEN -.-> KVC
   ROUTER -.-> BAL
   ATTN -.-> SPREAD
+  STREAM -.->|merges, faster| TOK
+  STREAM -.->|int32 tokens| DATA
+  SAMPLER -.->|window offsets| DATA
+  ROOF -.->|explains its cost| BATCH
   classDef foundation fill:#bfdbfe,stroke:#1d4ed8,color:#1f2937
   classDef modern fill:#bbf7d0,stroke:#15803d,color:#1f2937
   classDef evaluation fill:#e9d5ff,stroke:#7e22ce,color:#1f2937
+  classDef hardware fill:#fed7aa,stroke:#c2410c,color:#1f2937
   classDef cur fill:#fde68a,stroke:#b45309,stroke-width:4px,color:#111827,font-weight:bold
   classDef desc fill:#FBF9F3,stroke:#9ca3af,color:#111827,text-align:left
   class TOK,DATA,IDS,EMB,FNORM,HEAD,AUXC,N1,POS,ATTN,R1,N2,ROUTER,EXPERTS,SHARED,AUXLOSS,R2,LOSS,OPT,GEN,SCALE foundation
   class MTP,MLA,SDPA,QKN,DOCM,KVC,SIG,SEQBAL,BATCH,CLIP,LR,MUON,INIT,AUTOCAST,ZLOSS,SAMP modern
   class GACC,ABL,BUDG,PRES,BAL,SPREAD,CAP evaluation
+  class STREAM,SAMPLER,ROOF hardware
 ```
 
 **Interactive version:** [`site/architecture-map/`](../../site/architecture-map/index.html) (click any box to get its math doc, journal entry and code line; needs a browser and internet for the Mermaid library).
@@ -178,6 +187,9 @@ flowchart TB
 | Expert load, CV, routing entropy | [035 · Part 3 — Expert load, coefficient of variation, a...](035-modernized-presets-training-run.md#part-3--expert-load-coefficient-of-variation-and-routing-entropy-derived-from-zero) | [journal 035](../../journey_of_a_model/035-modernized-presets-training-run.md) | [`scripts/export_trace.py:198`](../../scripts/export_trace.py#L198) |
 | Attention-logit spread | [036 · Part 2 — The forward pass, then the new operations](036-attention-logit-spread.md#part-2--the-forward-pass-then-the-new-operations) | [journal 036](../../journey_of_a_model/036-visualizations-for-the-modernized-model.md) | [`scripts/export_trace.py:198`](../../scripts/export_trace.py#L198) |
 | Capacity check: params, memory, KV | [037 · Part 2 — estimate_params: parameter counting with...](037-scale-presets-and-capacity-check.md#part-2--estimate_params-parameter-counting-without-building-a-model) | [journal 037](../../journey_of_a_model/037-scale-presets-and-capacity-check.md) | [`scripts/check_capacity.py:172`](../../scripts/check_capacity.py#L172) |
+| Incremental BPE trainer + streamed corpus prep | [039 · Part 3 — The pair table, and why updating it equa...](039-bpe-incremental-counts-and-streaming.md#part-3--the-pair-table-and-why-updating-it-equals-recounting-it) | [journal 039](../../journey_of_a_model/039-real-pretraining-data-and-a-usable-bpe.md) | [`qwenmoe/tokenizer/bpe.py:104`](../../qwenmoe/tokenizer/bpe.py#L104) |
+| StepOffsetSampler + checkpoint retention | [041 · Part 2 — Resume is a pure function](041-step-offset-sampler-and-long-run-arithmetic.md#part-2--resume-is-a-pure-function) | [journal 041](../../journey_of_a_model/041-a-run-that-survives-the-night.md) | [`qwenmoe/data/sampler.py:56`](../../qwenmoe/data/sampler.py#L56) |
+| MFU + roofline: why the MoE dispatch is slow | [044 · Part 4 — The roofline](044-mfu-and-the-roofline.md#part-4--the-roofline) | [journal 044](../../journey_of_a_model/044-forty-five-minutes-on-a-real-h100.md) | [`qwenmoe/model/moe.py:322`](../../qwenmoe/model/moe.py#L322) |
 
 ## Timeline
 

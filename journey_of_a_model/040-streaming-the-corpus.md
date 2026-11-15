@@ -2,6 +2,10 @@
 
 **Type:** tooling (direct follow-up to 039) · **Date:** 2026-09-18
 
+> **Full derivation:** [`docs/math/039-bpe-incremental-counts-and-streaming.md`](../docs/math/039-bpe-incremental-counts-and-streaming.md)
+> (Parts 5–6) — the "exactly identical" claim stated as a condition on where the cut falls, checked against every real
+> cut, and the 19.45 GB → 4.00 GB memory ledger.
+
 ## TL;DR
 
 - **The blocker entry 039 left behind:** the shard on disk holds just under

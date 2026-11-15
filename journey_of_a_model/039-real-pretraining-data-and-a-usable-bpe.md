@@ -2,6 +2,10 @@
 
 **Type:** data + tooling (standalone scale-up request, not a spec task) · **Date:** 2026-09-18
 
+> **Full derivation:** [`docs/math/039-bpe-incremental-counts-and-streaming.md`](../docs/math/039-bpe-incremental-counts-and-streaming.md)
+> — the incremental pair table proved equal to a recount at every merge, the work counted (not timed), and the exact
+> condition under which block-wise encoding (entry 040) equals whole-corpus encoding.
+
 ## TL;DR
 
 - **The complaint:** the biggest preset (`SCALE_300M`) wasn't producing good
